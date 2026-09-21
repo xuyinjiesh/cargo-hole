@@ -36,6 +36,7 @@ currently has no effect. See [Current status](#current-status).
 ```bash
 cargo hole list  --path .                 # every hole, with its spec and status
 cargo hole list  --path . --width 40      # truncate specs more aggressively
+cargo hole list  --path . --pretty        # group by file, wrap specs, colour
 cargo hole list  --path . --file lib.rs   # only holes in `lib.rs`
 cargo hole list  --path . --fail-on-unelaborated   # exit 1 if any hole remains
 cargo hole fill  --path .                 # fill holes, writing to .cargo-hole/
@@ -73,6 +74,18 @@ summary: 4 open, 0 pinned, 0 unresolvable
 Status is one of `open`, `PINNED`, or `UNRESOLVABLE`. Holes are listed one per
 blank-line-separated block: location, status, macro name, and syntactic
 position; then the enclosing signature and the spec.
+
+`--pretty` switches to a layout for reading rather than grepping: holes are
+grouped under their file, the spec is wrapped instead of truncated, and a header
+tallies the run. The default layout is unchanged and is what scripts should
+parse.
+
+`--color <auto|always|never>` adds ANSI emphasis; the default colours a terminal
+and stays plain when piped, and `NO_COLOR` is respected. Colour is never the only
+signal — every distinction it draws is also spelled out in the text.
+
+Note that statuses are counted independently, so a hole that is both pinned and
+unresolvable is counted in both columns.
 
 `--file` matches the **file name** exactly, not a path substring — `--file
 lib.rs` works, `--file src/lib.rs` matches nothing.
@@ -266,13 +279,13 @@ Not implemented yet, and therefore not relied upon by anything:
 ## Development
 
 ```bash
-cargo test            # 39 tests, all offline
+cargo test            # 67 tests, all offline
 cargo build
 ```
 
-The suite is hermetic: the 39 tests live in `src/agent.rs` (10), `src/filler.rs`
-(4), `src/storage.rs` (14) and `src/storage/disk.rs` (11), need no network, and
-there is no ignored/live-provider test group.
+The suite is hermetic: the 67 tests live in `src/agent.rs` (10), `src/filler.rs`
+(4), `src/storage.rs` (14), `src/storage/disk.rs` (11) and `src/render.rs` (28),
+need no network, and there is no ignored/live-provider test group.
 
 > Known flake: `temp_root()` builds a per-test directory out of the process id
 > and a counter but never removes it, so a recycled pid can inherit a directory
@@ -289,6 +302,7 @@ there is no ignored/live-provider test group.
 | `filler.rs` | prompt assembly, reply extraction, splicing into the file |
 | `storage.rs` | the store, the ledger entry format, and `Hole::hole_key` contracts |
 | `storage/disk.rs` | the on-disk backend: atomic artifacts and an append-only ledger |
+| `render.rs` | `list` output: the plain and pretty layouts, colour, wrapping, width |
 | `agent.rs` | config file and `CARGO_HOLE_*` layering, agent selection |
 | `agent/codex.rs` | driving `codex exec --json`, parsing its JSONL events |
 | `util.rs` | file walk, byte-level scanner (delimiters, comments, strings), line/column |

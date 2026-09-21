@@ -3,6 +3,7 @@ use std::{fs::canonicalize, path::PathBuf, unimplemented};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::render::{ColorMode, Env, RenderOptions, render_list};
 use crate::{agent::Agent, filler::Filler, hole::Hole, storage::Storage, util::display_rel_path};
 #[derive(Parser, Debug)]
 #[command(
@@ -37,9 +38,16 @@ struct ListArgs {
     /// Exit non-zero if any `spec:` hole is still unelaborated.
     #[arg(long)]
     fail_on_unelaborated: bool,
-    /// Maximum characters of each spec to display.
+    /// Maximum characters of each spec to display in the default layout.
     #[arg(long, default_value_t = 60)]
     width: usize,
+    /// Group holes by file and show each one as a block, with the whole spec
+    /// wrapped rather than truncated. Meant for reading.
+    #[arg(long)]
+    pretty: bool,
+    /// When to colour the output.
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
 }
 
 #[derive(Parser, Debug)]
@@ -132,59 +140,14 @@ fn list(args: ListArgs) -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    if holes.is_empty() {
-        println!("no holes found in {}", display_rel_path(&root, &root));
-        return Ok(());
-    }
+    // Rendering is a pure function of the holes and the environment, so `list`
+    // only has to resolve the options and print. Pinned and unresolvable are
+    // counted as independent sets: a hole can be both, and subtracting them
+    // from the total separately would underflow.
+    let opts = RenderOptions::resolve(args.pretty, args.color, &Env::detect(), args.width);
+    print!("{}", render_list(&holes, &root, &opts));
 
-    let pinned = holes.iter().filter(|h| h.pinned).count();
-    let unresolvable = holes.iter().filter(|h| h.unresolvable.is_some()).count();
-
-    println!(
-        "{} hole(s) in {}", 
-        holes.len(), root.display(),
-    );
-    println!();
-
-    for (i, hole) in holes.iter().enumerate() {
-        let status = if hole.unresolvable.is_some() {
-            "UNRESOLVABLE"
-        } else if hole.pinned {
-            "PINNED"
-        } else {
-            "open"
-        };
-        println!(
-            "[{:>2}] {}:{}  {}  ({}, {})",
-            i + 1,
-            display_rel_path(&root, &hole.file),
-            hole.line,
-            status,
-            hole.macro_name,
-            hole.position.as_str(),
-        );
-        println!("     fn:   {}", hole.fn_sig);
-        println!("     spec: {}", hole.spec_summary(args.width));
-        if let Some(reason) = &hole.unresolvable {
-            println!("     why:  {reason}");
-        }
-        println!();
-    }
-
-    println!(
-        "summary: {} open, {} pinned, {} unresolvable",
-        holes.len() - pinned - unresolvable,
-        pinned,
-        unresolvable
-    );
-    if pinned > 0 {
-        println!(
-            "note: {pinned} pinned hole(s) are hand-written and will never be regenerated; \
-             they are tracked technical debt."
-        );
-    }
-
-    if args.fail_on_unelaborated && !holes.is_empty() {
+    if args.fail_on_unelaborated {
         anyhow::bail!(
             "{} unelaborated hole(s) present and --fail-on-unelaborated was given",
             holes.len()
