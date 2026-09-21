@@ -13,8 +13,8 @@
 //! temporary file in the destination directory and is then renamed over the
 //! target, which is atomic within a filesystem.
 //!
-//! The order between the two is deliberate: an artifact is written **first**, its
-//! ledger entry second. Crash in between and the ledger is simply missing an
+//! The order between the two is deliberate: the artifact is written **first**,
+//! its ledger entry second. Crash in between and the ledger is simply missing an
 //! entry, which costs one regeneration on the next run. The reverse order would
 //! leave the ledger claiming that code exists which does not, and no later run
 //! could tell the difference.
@@ -32,19 +32,20 @@ use super::{Entry, LEDGER_FILE, SCHEMA, STORE_DIR};
 /// Counter for unique temporary filenames within this process.
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
 
-/// Artifacts and the ledger, read into memory and appended as fills land.
+/// Artifacts and the ledger, read into memory and appended to as holes are
+/// filled.
 #[derive(Debug)]
 pub struct DiskCache {
     /// The crate root, as given to [`DiskCache::open`].
     root: PathBuf,
     /// `<root>/.cargo-hole`, where everything this backend writes lives.
     dir: PathBuf,
-    /// Every entry read or written so far, in file order, grouped by hole id.
+    /// The recorded code for each hole, in the order the ledger listed.
     ///
-    /// A `Vec` rather than a single entry: the newest one answers a lookup, but
-    /// keeping the history is what lets a reviewer see that an answer was
-    /// replaced, and by which agent.
-    by_id: HashMap<String, Vec<Entry>>,
+    /// Only the newest entry per hole is kept: older ones were superseded and
+    /// nothing reads them, and holding every historical answer would grow
+    /// without bound as a crate is regenerated over time.
+    by_id: HashMap<String, String>,
 }
 
 impl DiskCache {
@@ -139,86 +140,35 @@ impl DiskCache {
         Ok(dest)
     }
 
-    /// The most recent entry for `id`, verified or not. For reporting.
-    pub fn lookup(&self, id: &str) -> Option<&Entry> {
-        self.by_id.get(id).and_then(|entries| entries.last())
+    /// The recorded code for hole `id`, if the ledger has an answer for it.
+    pub fn get(&self, id: &str) -> Option<&str> {
+        self.by_id.get(id).map(String::as_str)
     }
 
-    /// The most recent entry for `id` that a compile gate accepted.
+    /// Append `id -> code` to the ledger and index it.
     ///
-    /// Scanning backwards rather than looking only at the newest entry is
-    /// deliberate. A regeneration that fails the gate appends nothing, so the
-    /// newest entry can be an unverified candidate while the artifact on disk
-    /// still holds an older verified answer. Returning that older entry is what
-    /// matches what the file actually contains.
-    pub fn lookup_verified(&self, id: &str) -> Option<&Entry> {
-        self.by_id
-            .get(id)?
-            .iter()
-            .rev()
-            .find(|entry| entry.verified)
-    }
-
-    /// Append `entry` to the ledger and index it.
-    ///
-    /// Call this only once the artifact is on disk; see the module docs for why
-    /// the order is not interchangeable.
+    /// The caller must have compiled `code` in its tree first; see
+    /// [`super::Storage::put`]. Call it only once the artifact is on
+    /// disk, and see the module docs for why that order is not interchangeable.
     ///
     /// The write is not fsynced. A lost tail entry costs one regeneration, which
-    /// is always correct, while an fsync per hole would dominate the runtime of
-    /// a run that is otherwise network-bound.
-    pub fn record(&mut self, entry: Entry) -> Result<()> {
+    /// is always correct, while an fsync per hole would dominate the runtime of a
+    /// run that is otherwise network-bound.
+    pub fn put(&mut self, id: &str, code: &str) -> Result<()> {
+        let entry = Entry::new(id, code);
         self.append(&entry)?;
-        self.by_id.entry(entry.id.clone()).or_default().push(entry);
+        self.by_id.insert(id.to_string(), code.to_string());
         Ok(())
     }
 
-    /// Mark every unverified entry from `session` as verified, returning how
-    /// many were newly marked.
-    ///
-    /// Implemented as an append of updated copies, so the ledger stays
-    /// append-only and the existing bytes are never rewritten. Idempotent:
-    /// entries already marked are skipped, so a second call appends nothing.
-    pub fn mark_session_verified(&mut self, session: u64) -> Result<usize> {
-        let mut confirmed: Vec<Entry> = Vec::new();
-        for entries in self.by_id.values() {
-            for entry in entries {
-                if entry.session == session && !entry.verified {
-                    let mut updated = entry.clone();
-                    updated.verified = true;
-                    confirmed.push(updated);
-                }
-            }
-        }
-        if confirmed.is_empty() {
-            return Ok(0);
-        }
-        for entry in &confirmed {
-            self.append(entry)?;
-        }
-        let count = confirmed.len();
-        for entry in confirmed {
-            self.by_id.entry(entry.id.clone()).or_default().push(entry);
-        }
-        Ok(count)
-    }
-
-    /// How many distinct holes the ledger knows about, verified or not.
+    /// How many distinct holes the ledger has an answer for.
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
 
-    /// Whether the ledger knows about no holes at all.
+    /// Whether the ledger has no answers at all.
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
-    }
-
-    /// How many holes have an answer a compile gate accepted.
-    pub fn verified_count(&self) -> usize {
-        self.by_id
-            .values()
-            .filter(|entries| entries.iter().any(|entry| entry.verified))
-            .count()
     }
 
     /// Append one entry as a line of JSON.
@@ -239,7 +189,7 @@ impl DiskCache {
     }
 }
 
-/// Read the ledger at `path` into entries grouped by hole id, in file order.
+/// Read the ledger at `path` into the newest answer per hole id.
 ///
 /// A missing ledger is an empty one. An unreadable *last* line is tolerated
 /// silently: a tear in the tail is the expected shape of a crash during an
@@ -247,8 +197,8 @@ impl DiskCache {
 /// is designed to survive. Damage anywhere else means something unexpected
 /// happened and is worth a warning, but it still must not fail the run -- the
 /// entries around it are intact, and regenerating the rest is always correct.
-fn load_ledger(path: &Path) -> Result<HashMap<String, Vec<Entry>>> {
-    let mut by_id: HashMap<String, Vec<Entry>> = HashMap::new();
+fn load_ledger(path: &Path) -> Result<HashMap<String, String>> {
+    let mut by_id: HashMap<String, String> = HashMap::new();
 
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -268,8 +218,11 @@ fn load_ledger(path: &Path) -> Result<HashMap<String, Vec<Entry>>> {
             // fields may no longer mean what this binary thinks they mean, so
             // the entry is ignored rather than misread: regenerating it costs
             // one model call, misreading it could splice the wrong code.
+            //
+            // An entry that is *later* in the file overwrites an earlier one, so
+            // this naturally keeps the newest answer per hole.
             Ok(entry) if entry.v == SCHEMA => {
-                by_id.entry(entry.id.clone()).or_default().push(entry);
+                by_id.insert(entry.id, entry.code);
             }
             Ok(_) => {}
             Err(_) if Some(n) == last_content => {}
@@ -371,32 +324,56 @@ mod tests {
     }
 
     #[test]
+    fn an_artifact_write_records_nothing() {
+        // An artifact is rewritten on every attempt, most of which never
+        // compile. Only `put` may record anything in the ledger.
+        let root = temp_root();
+        let cache = DiskCache::open(&root).expect("open");
+        cache
+            .write_artifact(&root.join("src/lib.rs"), "n + 1")
+            .expect("write");
+        assert!(cache.is_empty(), "writing a candidate must not cache it");
+        assert!(!root.join(STORE_DIR).join(LEDGER_FILE).exists());
+    }
+
+    #[test]
     fn a_missing_ledger_reads_as_empty() {
         let root = temp_root();
         let cache = DiskCache::open(&root).expect("open");
         assert!(cache.is_empty());
-        assert_eq!(cache.verified_count(), 0);
     }
 
     #[test]
-    fn entries_are_indexed_in_file_order() {
+    fn the_newest_entry_for_a_hole_wins() {
         let root = temp_root();
         let mut cache = DiskCache::open(&root).expect("open");
-        cache
-            .record(Entry::new("a", "first", "agent"))
-            .expect("record");
-        cache
-            .record(Entry::new("a", "second", "agent"))
-            .expect("record");
-        assert_eq!(cache.lookup("a").expect("found").code, "second");
+        cache.put("a", "first").expect("record");
+        cache.put("a", "second").expect("record");
+        assert_eq!(cache.get("a"), Some("second"));
+        assert_eq!(cache.len(), 1, "one hole, two answered attempts");
+    }
+
+    #[test]
+    fn the_newest_entry_wins_after_reopening_too() {
+        // Reading keeps the last appearance, not the first, so ordering must
+        // survive a round trip through the file.
+        let root = temp_root();
+        {
+            let mut cache = DiskCache::open(&root).expect("open");
+            cache.put("a", "first").expect("record");
+            cache.put("a", "second").expect("record");
+        }
+        let cache = DiskCache::open(&root).expect("reopen");
+        assert_eq!(cache.get("a"), Some("second"));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
     fn the_ledger_is_one_json_object_per_line() {
         let root = temp_root();
         let mut cache = DiskCache::open(&root).expect("open");
-        cache.record(Entry::new("a", "1", "agent")).expect("record");
-        cache.record(Entry::new("b", "2", "agent")).expect("record");
+        cache.put("a", "1").expect("record");
+        cache.put("b", "2").expect("record");
 
         let text = std::fs::read_to_string(root.join(STORE_DIR).join(LEDGER_FILE)).expect("read");
         let lines: Vec<&str> = text.lines().collect();
@@ -408,19 +385,16 @@ mod tests {
     }
 
     #[test]
-    fn marking_a_session_appends_rather_than_rewriting() {
-        // The ledger is append-only, so confirming a run must not disturb the
+    fn recording_appends_rather_than_rewriting() {
+        // The ledger is append-only, so a regeneration must not disturb the
         // bytes already written -- another process may be reading them.
         let root = temp_root();
         let mut cache = DiskCache::open(&root).expect("open");
-        let session = super::super::new_session();
-        let mut entry = Entry::new("a", "1", "agent");
-        entry.session = session;
-        cache.record(entry).expect("record");
+        cache.put("a", "1").expect("record");
 
         let ledger = root.join(STORE_DIR).join(LEDGER_FILE);
         let before = std::fs::read_to_string(&ledger).expect("read");
-        assert_eq!(cache.mark_session_verified(session).expect("mark"), 1);
+        cache.put("a", "2").expect("record");
         let after = std::fs::read_to_string(&ledger).expect("read");
         assert!(
             after.starts_with(&before),

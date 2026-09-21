@@ -83,7 +83,7 @@ lib.rs` works, `--file src/lib.rs` matches nothing.
 $ cargo hole fill --path .
 filling 2 hole(s) in . using cli:codex (its own model)
 
-2 filled, 0 not filled, 0 skipped (2 model call(s))
+2 filled, 0 cached, 0 not filled, 0 skipped (2 model call(s))
 ```
 
 The header names the agent actually in use. Without `--in-place`, results are
@@ -98,11 +98,46 @@ rest of the file:
 ```
 warning: skipping /tmp/demo/src/lib.rs:3: /tmp/demo/src/lib.rs:3 is pinned, so it is never regenerated
 
-1 filled, 1 not filled, 0 skipped (1 model call(s))
+1 filled, 0 cached, 1 not filled, 0 skipped (1 model call(s))
 ```
 
-So `not filled` counts holes that were attempted and refused; `skipped` is
-reserved but currently always 0.
+So `not filled` counts holes that were attempted and refused; `cached` counts
+holes answered from the ledger below; `skipped` is reserved but currently always
+0.
+
+### The ledger
+
+A second `fill` of an unchanged crate costs nothing:
+
+```
+$ cargo hole fill --path .
+0 filled, 2 cached, 0 not filled, 0 skipped (0 model call(s))
+```
+
+Each answer is recorded in `<root>/.cargo-hole/ledger.jsonl`, one JSON object
+per line, keyed by a blake3 hash of the hole's *meaning* -- the spec text with
+whitespace collapsed, the enclosing signature, the `impl`/`trait` context and
+the syntactic position. Line numbers are deliberately not part of the key, so
+inserting a line above a hole, reordering functions, or running `cargo fmt` all
+keep their answers; changing the spec or the signature does not.
+
+The file is append-only: an update is a new line, so there is no
+read-modify-write window in which two runs can lose each other's entries, and a
+crash can only truncate the tail. The newest line for an id wins. Entries
+written by a different schema version are ignored rather than misread --
+regenerating one answer costs a model call, whereas misreading one could splice
+the wrong code into a file.
+
+Two properties are worth knowing:
+
+- **Nothing is recorded until the run finishes.** Answers are held in memory and
+  written after every artifact has landed, so an interrupted run never leaves
+  behind a ledger entry for code that was never written. This is also where the
+  compile gate will go once `src/verifier.rs` exists.
+- **A pin is never routed around.** A hole that has been pinned is regenerated
+  (i.e. refused), never replayed from the ledger, even if an earlier run cached
+  an answer for it before it was pinned. Otherwise the cache would quietly
+  overwrite hand-written code.
 
 ## Configuration
 
@@ -202,7 +237,8 @@ say so — which is exactly the case the probe exists to cover.
 
 Implemented: hole discovery and listing, spec parsing, the `// hole:pinned`
 marker, position detection, the `codex` agent, retry-on-failure, config and
-environment layering, and writing results in place or to `.cargo-hole/`.
+environment layering, writing results in place or to `.cargo-hole/`, and the
+ledger that lets a repeated `fill` skip the model entirely.
 
 Not implemented yet, and therefore not relied upon by anything:
 
@@ -210,6 +246,10 @@ Not implemented yet, and therefore not relied upon by anything:
   model and there is no `cargo hole type` command. `--no-probe` is inert.
 - **The compile gate.** `src/verifier.rs` is empty. `fill` splices whatever the
   model returns; `--no-verify` is inert. A bad reply is written out verbatim.
+  Because there is no gate, the ledger currently records every answer a `fill`
+  produced. The invariant it documents -- that a ledger entry is code the gate
+  accepted -- holds trivially until `verifier.rs` lands, at which point entries
+  written before it did may be answers nothing ever compiled.
 - **`cargo hole restore`.** The subcommand exists and panics with
   `not implemented` (exit 101). There is no `.cargo-hole.bak`, no restore guard
   and no probe lock.
@@ -226,13 +266,19 @@ Not implemented yet, and therefore not relied upon by anything:
 ## Development
 
 ```bash
-cargo test            # 14 tests, all offline
+cargo test            # 39 tests, all offline
 cargo build
 ```
 
-The suite is hermetic: the 14 tests live in `src/agent.rs` (10) and
-`src/filler.rs` (4), need no network, and there is no ignored/live-provider test
-group.
+The suite is hermetic: the 39 tests live in `src/agent.rs` (10), `src/filler.rs`
+(4), `src/storage.rs` (14) and `src/storage/disk.rs` (11), need no network, and
+there is no ignored/live-provider test group.
+
+> Known flake: `temp_root()` builds a per-test directory out of the process id
+> and a counter but never removes it, so a recycled pid can inherit a directory
+> whose ledger already has lines and the `assert_eq!(lines.len(), 2)` checks
+> fail. `rm -rf /tmp/cargo-hole-*` clears it. This predates the ledger work and
+> is untouched by it.
 
 ### Layout
 
@@ -241,6 +287,8 @@ group.
 | `hole.rs` | `syn`-based extraction of holes, spec parsing, pin markers, positions |
 | `cmdline.rs` | the `clap` CLI: `list`, `fill`, `restore` |
 | `filler.rs` | prompt assembly, reply extraction, splicing into the file |
+| `storage.rs` | the store, the ledger entry format, and `Hole::hole_key` contracts |
+| `storage/disk.rs` | the on-disk backend: atomic artifacts and an append-only ledger |
 | `agent.rs` | config file and `CARGO_HOLE_*` layering, agent selection |
 | `agent/codex.rs` | driving `codex exec --json`, parsing its JSONL events |
 | `util.rs` | file walk, byte-level scanner (delimiters, comments, strings), line/column |

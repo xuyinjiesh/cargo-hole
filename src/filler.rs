@@ -21,18 +21,22 @@ impl<'a> Filler<'a> {
         Filler { root, agent }
     }
 
-    /// Replace `hole` with an expression from the agent.
+    /// Ask the agent for an expression to put in `hole`.
     ///
-    /// Returns the new contents of the file together with the number of model
-    /// calls it took. Returning the whole file rather than just the expression
-    /// lets the caller fill later holes without re-reading from disk; nothing is
-    /// written here, since persisting the result is the caller's decision.
+    /// Returns that expression together with the number of model calls it took.
+    /// The expression is returned bare rather than already spliced into the
+    /// file: the caller owns the file contents, and it needs the expression on
+    /// its own to record in the ledger.
+    ///
+    /// Nothing is written here, and `src` is not consulted: the prompt carries
+    /// the spec and the hole's position, and the type probe that would read the
+    /// surrounding file is not implemented yet (`src/prober.rs` is empty).
     ///
     /// Pinned and unresolvable holes are refused rather than filled: the caller
     /// is expected to have filtered them out already, so reaching either check
     /// is a bug worth reporting instead of patching bytes that were never
     /// validated.
-    pub fn fill_holes(&self, hole: &Hole, src: &str) -> Result<(String, u32)> {
+    pub fn fill_holes(&self, hole: &Hole) -> Result<(String, u32)> {
         if hole.pinned {
             bail!("{} is pinned, so it is never regenerated", hole.location());
         }
@@ -75,11 +79,7 @@ impl<'a> Filler<'a> {
                 }
             };
 
-            // Splice into a fresh copy of the original: a rejected candidate is
-            // thrown away rather than compounded into the next one.
-            let mut patched = src.to_string();
-            patched.replace_range(hole.byte_start..hole.byte_end, &code);
-            return Ok((patched, attempt));
+            return Ok((code, attempt));
         }
 
         bail!(
