@@ -1,0 +1,26 @@
+[package]
+name = "cargo-hole"
+version = "0.1.0"
+edition = "2024"
+description = "Fill `todo!(\"spec: ...\")` holes in Rust using rustc itself as the type-query API"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full", "visit", "parsing"] }
+toml = "0.9"
+
+# Needed only to kill a timed-out child's whole process group. Killing just the
+# direct child leaves grandchildren (rustc under cargo, `sleep` under `sh`)
+# holding the stdout pipe open, so the reader threads never see EOF.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+blake3 = "1"

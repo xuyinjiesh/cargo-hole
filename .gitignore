@@ -1,0 +1,9 @@
+/target
+# Workspace-local CARGO_HOME shim, used only when the real ~/.cargo is read-only
+/.cargo/
+# Fixture build artifacts and transient probe state
+/tests/fixtures/*/target/
+/tests/fixtures/*/Cargo.lock
+*.cargo-hole.bak
+.cargo-hole.probe.lock
+/.npm/
