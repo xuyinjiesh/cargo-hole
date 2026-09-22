@@ -5,3 +5,5 @@ pub mod hole;
 pub mod render;
 pub mod storage;
 pub mod util;
+pub mod verifier;
+pub mod prober;

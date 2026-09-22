@@ -1,24 +1,82 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
+use crate::hole::HoleIndex;
+use crate::prober::{ProbeOutcome, Prober};
 use crate::{agent::Agent, hole::Hole, util::display_rel_path};
 
 pub const OPEN_MARKER: &str = "<<<HOLE>>>";
 pub const CLOSE_MARKER: &str = "<<<END>>>";
 
+/// What the probe learned, keyed by hole so `fill` can look it up later.
+///
+/// A `HashMap` rather than a `Vec` because `fill` reaches a hole's verdict by
+/// identity, and the batch and the per-hole fallback both key off the same
+/// value.
+pub type Expectations = HashMap<HoleIndex, ProbeOutcome>;
+
 /// Fills holes by asking an [`Agent`] for one expression per hole.
 ///
-/// The type probe is not wired in yet (`src/prober.rs` is empty), so the prompt
-/// currently carries only the spec and the hole's position.
+/// The prompt carries the spec, the hole's position, and — when the type probe
+/// can find one — the type rustc expects at that position. The expected type is
+/// the difference between asking a model to invent a value and asking it to
+/// produce one of a known type.
 pub struct Filler<'a> {
     root: PathBuf,
     agent: &'a Agent,
+    /// `None` disables probing (`--no-probe`), so the prompt carries no expected
+    /// type and every hole costs no `cargo check`.
+    prober: Option<Prober>,
 }
 
 impl<'a> Filler<'a> {
+    /// A filler that probes for expected types.
     pub fn new(root: PathBuf, agent: &'a Agent) -> Filler<'a> {
-        Filler { root, agent }
+        let prober = Prober::new(root.clone(), crate::prober::ProberOptions::from_env());
+        Filler {
+            root,
+            agent,
+            prober: Some(prober),
+        }
+    }
+
+    /// A filler that never probes, for `--no-probe`.
+    pub fn without_probe(root: PathBuf, agent: &'a Agent) -> Filler<'a> {
+        Filler {
+            root,
+            agent,
+            prober: None,
+        }
+    }
+
+    /// Probe every hole up front, so the whole run costs one `cargo check` per
+    /// file instead of one per hole.
+    ///
+    /// Call this before filling. [`Filler::fill_hole_with`] then reads the
+    /// verdict instead of probing again. Without it, each `fill_hole_with` falls
+    /// back to probing its own hole, which is correct but slower.
+    ///
+    /// Probing mutates and restores each file byte-for-byte, so this is safe to
+    /// call before any file has been read or written.
+    pub fn probe_all(&self, holes: &[Hole]) -> Expectations {
+        let Some(prober) = self.prober.as_ref() else {
+            return Expectations::new();
+        };
+
+        let outcomes = prober.probe_all(holes);
+        let mut out = Expectations::with_capacity(holes.len());
+        for (hole, outcome) in holes.iter().zip(outcomes) {
+            if let ProbeOutcome::Broken(e) = &outcome {
+                eprintln!(
+                    "warning: could not probe {}: {e:#}; filling from the spec alone",
+                    hole.location()
+                );
+            }
+            out.insert(hole.index_key(), outcome);
+        }
+        out
     }
 
     /// Ask the agent for an expression to put in `hole`.
@@ -28,15 +86,29 @@ impl<'a> Filler<'a> {
     /// file: the caller owns the file contents, and it needs the expression on
     /// its own to record in the ledger.
     ///
-    /// Nothing is written here, and `src` is not consulted: the prompt carries
-    /// the spec and the hole's position, and the type probe that would read the
-    /// surrounding file is not implemented yet (`src/prober.rs` is empty).
-    ///
     /// Pinned and unresolvable holes are refused rather than filled: the caller
     /// is expected to have filtered them out already, so reaching either check
     /// is a bug worth reporting instead of patching bytes that were never
     /// validated.
-    pub fn fill_holes(&self, hole: &Hole) -> Result<(String, u32)> {
+    pub fn fill_hole(&self, hole: &Hole) -> Result<(String, u32)> {
+        self.fill_hole_with(hole, None)
+    }
+
+    /// As [`Filler::fill_hole`], but reusing a verdict from
+    /// [`Filler::probe_all`] when one was supplied for this hole.
+    ///
+    /// The probe runs at most once per hole, before the attempt loop: it costs a
+    /// `cargo check`, and the expected type cannot change between attempts
+    /// because nothing is written until one succeeds.
+    ///
+    /// Probing patches the hole's file on disk and restores it byte-for-byte, so
+    /// any `src` the caller is holding stays valid. That property is what makes
+    /// it safe to probe while `fill` is midway through a file.
+    pub fn fill_hole_with(
+        &self,
+        hole: &Hole,
+        known: Option<&Expectations>,
+    ) -> Result<(String, u32)> {
         if hole.pinned {
             bail!("{} is pinned, so it is never regenerated", hole.location());
         }
@@ -48,11 +120,24 @@ impl<'a> Filler<'a> {
             );
         }
 
+        // Reuse the batch's verdict when there is one; otherwise probe just this
+        // hole, which is the only option if `probe_all` was never called.
+        // `ProbeOutcome` holds an `anyhow::Error` and so cannot be cloned, hence
+        // the borrow: `fallback` keeps the locally-probed result alive.
+        let fallback;
+        let expected: Option<&ProbeOutcome> = match known.and_then(|k| k.get(&hole.index_key())) {
+            Some(outcome) => Some(outcome),
+            None => {
+                fallback = self.probe(hole);
+                fallback.as_ref()
+            }
+        };
+
         let mut feedback: Option<String> = None;
         let max_attempts = self.agent.max_attempts();
 
         for attempt in 1..=max_attempts {
-            let prompt = self.build_prompt(hole, feedback.as_deref());
+            let prompt = self.build_prompt(hole, expected, feedback.as_deref());
             let raw = match self.agent.handle(&prompt) {
                 Ok(raw) => raw,
                 Err(e) => {
@@ -88,7 +173,29 @@ impl<'a> Filler<'a> {
         )
     }
 
-    pub fn build_prompt(&self, hole: &Hole, feedback: Option<&str>) -> String {
+    /// Probe for the hole's expected type, or `None` when probing is off.
+    ///
+    /// A broken probe is a warning, not a failure: the model can still work from
+    /// the spec alone, which is what the tool did before the probe existed.
+    /// Losing the whole fill over a missing `cargo` would be a poor trade.
+    fn probe(&self, hole: &Hole) -> Option<ProbeOutcome> {
+        let prober = self.prober.as_ref()?;
+        let outcome = prober.probe(hole);
+        if let ProbeOutcome::Broken(e) = &outcome {
+            eprintln!(
+                "warning: could not probe {}: {e:#}; filling from the spec alone",
+                hole.location()
+            );
+        }
+        Some(outcome)
+    }
+
+    pub fn build_prompt(
+        &self,
+        hole: &Hole,
+        expected: Option<&ProbeOutcome>,
+        feedback: Option<&str>,
+    ) -> String {
         let mut prompt = String::new();
 
         prompt.push_str(&format!(
@@ -97,6 +204,10 @@ impl<'a> Filler<'a> {
         ));
         prompt.push_str(&format!("Line: {}\n", hole.line));
         prompt.push_str(&format!("Position: {}\n", hole.position.as_str()));
+
+        if let Some(expectation) = expected_type_hint(expected) {
+            prompt.push_str(&format!("Expected type: {expectation}\n"));
+        }
 
         prompt.push_str(&format!("\nSpecification:\n{}\n", hole.spec));
 
@@ -110,6 +221,24 @@ impl<'a> Filler<'a> {
         }
 
         prompt
+    }
+}
+
+/// Render the probe's verdict as a line for the prompt.
+///
+/// `None` means no line is emitted at all, which is the right answer for
+/// `--no-probe` and for a probe that could not run: inventing "unknown" as an
+/// expected type would only invite the model to guess at a type that was never
+/// established.
+fn expected_type_hint(expected: Option<&ProbeOutcome>) -> Option<String> {
+    match expected? {
+        ProbeOutcome::Known(ty) => Some(ty.clone()),
+        // Said plainly rather than omitted, so the model does not assume a type
+        // was checked and found to be something obvious.
+        ProbeOutcome::NoExpectation => {
+            Some("none discovered -- infer it from the specification".to_string())
+        }
+        ProbeOutcome::ProbeFailed(_) | ProbeOutcome::Broken(_) => None,
     }
 }
 
@@ -180,5 +309,32 @@ mod tests {
     fn an_empty_reply_is_rejected() {
         assert!(extract_expression("   ").is_err());
         assert!(extract_expression("<<<HOLE>>>  <<<END>>>").is_err());
+    }
+
+    #[test]
+    fn a_known_type_is_carried_into_the_prompt() {
+        let hint = expected_type_hint(Some(&ProbeOutcome::Known("Vec<String>".into())));
+        assert_eq!(hint.as_deref(), Some("Vec<String>"));
+    }
+
+    #[test]
+    fn no_expectation_is_stated_rather_than_omitted() {
+        // Silence would read as "no type was needed"; saying so explicitly
+        // stops the model from assuming a type was verified.
+        let hint = expected_type_hint(Some(&ProbeOutcome::NoExpectation));
+        let hint = hint.expect("a hint line is emitted");
+        assert!(hint.contains("none discovered"), "{hint}");
+        assert!(hint.contains("infer it from the specification"), "{hint}");
+    }
+
+    #[test]
+    fn a_failed_probe_contributes_no_hint_at_all() {
+        // A failure or a missing cargo must not become "unknown": that would
+        // invite the model to guess a type nothing established.
+        assert!(expected_type_hint(None).is_none());
+        assert!(expected_type_hint(Some(&ProbeOutcome::ProbeFailed("boom".into()))).is_none());
+        assert!(
+            expected_type_hint(Some(&ProbeOutcome::Broken(anyhow::anyhow!("no cargo")))).is_none()
+        );
     }
 }

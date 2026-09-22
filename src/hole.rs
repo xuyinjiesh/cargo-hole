@@ -70,6 +70,8 @@ pub struct Hole {
     pub unresolvable: Option<String>,
 }
 
+pub type HoleIndex = (PathBuf, usize, usize);
+
 impl Hole {
     /// Every hole in the crate, sorted by file then position.
     pub fn list_holes(root: &Path) -> Result<Vec<Hole>> {
@@ -127,24 +129,28 @@ impl Hole {
         src.get(self.byte_start..self.byte_end)
     }
 
-    pub fn hole_key(hole: &Hole) -> String {
+    pub fn hash_key(&self) -> String {
         let mut h = blake3::Hasher::new();
         h.update(b"cargo-hole/v1\0");                      // 换方案时递增，旧条目自动失配
         // L0 优先级：规约
-        h.update(collapse_ws(&hole.spec).as_bytes());      // 折叠空白
+        h.update(collapse_ws(&self.spec).as_bytes());      // 折叠空白
         fn collapse_ws(s: &str) -> String {
             s.split_whitespace().collect::<Vec<_>>().join(" ")
         }
         h.update(b"\0");
         // L1 优先级：局部上下文
-        h.update(hole.fn_sig.trim().as_bytes());           // 契约变了就必须重算
+        h.update(self.fn_sig.trim().as_bytes());           // 契约变了就必须重算
         h.update(b"\0");
-        h.update(hole.impl_ctx.as_deref().unwrap_or("").trim().as_bytes());
+        h.update(self.impl_ctx.as_deref().unwrap_or("").trim().as_bytes());
         h.update(b"\0");
-        h.update(hole.position.as_str().as_bytes());       // statement / expression 影响期望类型
+        h.update(self.position.as_str().as_bytes());       // statement / expression 影响期望类型
         // L2 优先级：全局上下文（未完待续）
         // L3 优先级：环境（未完待续）
         h.finalize().to_hex()[..16].to_string()
+    }
+
+    pub fn index_key(&self) -> (PathBuf, usize, usize) {
+        (self.file.clone(), self.byte_start, self.byte_end)
     }
 }
 

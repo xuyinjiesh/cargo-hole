@@ -349,8 +349,8 @@ mod tests {
     // hole's answer to another.
     #[test]
     fn the_key_ignores_where_the_hole_sits() {
-        let first = Hole::hole_key(&hole_at("double the input", 10));
-        let shifted = Hole::hole_key(&hole_at("double the input", 99));
+        let first = Hole::hash_key(&hole_at("double the input", 10));
+        let shifted = Hole::hash_key(&hole_at("double the input", 99));
         assert_eq!(first, shifted);
 
         let mut moved = hole_at("double the input", 10);
@@ -358,7 +358,7 @@ mod tests {
         moved.byte_start = 700;
         moved.byte_end = 720;
         assert_eq!(
-            Hole::hole_key(&moved),
+            Hole::hash_key(&moved),
             first,
             "moving a function must not discard an answer that is still correct"
         );
@@ -368,11 +368,11 @@ mod tests {
     fn the_key_ignores_spec_whitespace() {
         // `cargo fmt` re-wraps a multi-line spec, and that must not throw the
         // cache away.
-        let wrapped = Hole::hole_key(&hole_at(
+        let wrapped = Hole::hash_key(&hole_at(
             "scale to fit within 1024px\n  on the longest side",
             10,
         ));
-        let flat = Hole::hole_key(&hole_at(
+        let flat = Hole::hash_key(&hole_at(
             "scale to fit within 1024px on the longest side",
             10,
         ));
@@ -381,8 +381,8 @@ mod tests {
 
     #[test]
     fn the_key_changes_when_the_spec_changes() {
-        let before = Hole::hole_key(&hole_at("double the input", 10));
-        let after = Hole::hole_key(&hole_at("triple the input", 10));
+        let before = Hole::hash_key(&hole_at("double the input", 10));
+        let after = Hole::hash_key(&hole_at("triple the input", 10));
         assert_ne!(before, after);
     }
 
@@ -393,8 +393,8 @@ mod tests {
         let mut changed = hole_at("double the input", 10);
         changed.fn_sig = "pub fn double(n: u64) -> u64".to_string();
         assert_ne!(
-            Hole::hole_key(&changed),
-            Hole::hole_key(&hole_at("double the input", 10))
+            Hole::hash_key(&changed),
+            Hole::hash_key(&hole_at("double the input", 10))
         );
     }
 
@@ -405,8 +405,8 @@ mod tests {
         let mut other = hole_at("double the input", 10);
         other.fn_sig = "pub fn triple(n: i64) -> i64".to_string();
         assert_ne!(
-            Hole::hole_key(&other),
-            Hole::hole_key(&hole_at("double the input", 10))
+            Hole::hash_key(&other),
+            Hole::hash_key(&hole_at("double the input", 10))
         );
     }
 }

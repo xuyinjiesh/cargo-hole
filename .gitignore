@@ -7,3 +7,5 @@
 *.cargo-hole.bak
 .cargo-hole.probe.lock
 /.npm/
+# Scratch crates built by hand while checking how cargo behaves
+/.probe-test/

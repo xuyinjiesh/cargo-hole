@@ -197,7 +197,39 @@ fn fill(args: FillArgs) -> Result<()> {
         display_rel_path(&root, &root),
         agent.label(),
     );
-    let filler = Filler::new(root.clone(), &agent);
+    let filler = if args.no_probe {
+        Filler::without_probe(root.clone(), &agent)
+    } else {
+        Filler::new(root.clone(), &agent)
+    };
+
+    // Probe everything up front, so the whole run costs one `cargo check` per
+    // file rather than one per hole. This has to happen before any file is
+    // written, since probing patches and restores each file in place.
+    //
+    // Only holes that will actually be filled are probed: a pinned hole is never
+    // regenerated, and an unresolvable one is never patched, so neither needs a
+    // type. A single hole is left to `fill_hole`, which probes it just as well
+    // without paying for the batch machinery.
+    let needs_probe: Vec<Hole> = holes
+        .iter()
+        .filter(|h| !h.pinned && h.unresolvable.is_none())
+        .cloned()
+        .collect();
+    let expectations = if args.no_probe || needs_probe.len() < 2 {
+        Default::default()
+    } else {
+        // The file count is the useful number: it is how many `cargo check` runs
+        // this is about to cost.
+        let files: std::collections::BTreeSet<&PathBuf> =
+            needs_probe.iter().map(|h| &h.file).collect();
+        println!(
+            "probing {} hole(s) in {} file(s) for expected types",
+            needs_probe.len(),
+            files.len()
+        );
+        filler.probe_all(&needs_probe)
+    };
 
     // Group by file so each file is read and written once.
     let mut tree_holes: std::collections::BTreeMap<PathBuf, Vec<Hole>> = Default::default();
@@ -225,7 +257,7 @@ fn fill(args: FillArgs) -> Result<()> {
         file_holes.sort_by_key(|h| std::cmp::Reverse(h.byte_start));
 
         for hole in &file_holes {
-            let key = Hole::hole_key(hole);
+            let key = hole.hash_key();
 
             // Pinned and unresolvable holes never consult the ledger. A pin
             // says the hand-written body is the authority, so replaying a
@@ -242,7 +274,7 @@ fn fill(args: FillArgs) -> Result<()> {
                 }
             }
 
-            match filler.fill_holes(hole) {
+            match filler.fill_hole_with(hole, Some(&expectations)) {
                 Ok((code, calls)) => {
                     src.replace_range(hole.byte_start..hole.byte_end, code.as_str());
                     model_calls += calls;
