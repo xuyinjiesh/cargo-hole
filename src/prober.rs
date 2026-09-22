@@ -290,7 +290,7 @@ pub fn parse_diagnostics(stdout: &[u8]) -> Vec<Diagnostic> {
 /// comparison against an absolute path would never match. Handles the three
 /// shapes that actually occur: identical, absolute-and-equal, and
 /// relative-to-root.
-fn same_file(root: &Path, reported: &str, file: &Path) -> bool {
+pub fn same_file(root: &Path, reported: &str, file: &Path) -> bool {
     if reported.is_empty() {
         return false;
     }
@@ -422,16 +422,23 @@ pub struct CheckRun {
 }
 
 impl CheckRun {
-    fn errors(&self) -> impl Iterator<Item = &Diagnostic> {
+    /// Every error in the run.
+    pub fn errors(&self) -> impl Iterator<Item = &Diagnostic> {
         self.diagnostics.iter().filter(|d| d.is_error())
     }
 
-    fn error_count(&self) -> usize {
+    /// How many errors the run produced.
+    pub fn error_count(&self) -> usize {
         self.errors().count()
     }
 
+    /// Whether the crate compiled cleanly.
+    pub fn is_clean(&self) -> bool {
+        self.error_count() == 0
+    }
+
     /// A one-line summary of the errors, for user-facing messages.
-    fn error_summary(&self) -> String {
+    pub fn error_summary(&self) -> String {
         let errs: Vec<&Diagnostic> = self.errors().collect();
         if errs.is_empty() {
             let stderr = self.stderr.trim();
@@ -707,51 +714,83 @@ fn patched_source(src: &str, hole: &Hole) -> std::result::Result<String, String>
     Ok(out)
 }
 
-/// Replace several non-overlapping holes with [`UNIT`] in one pass.
+/// One replacement: bytes `byte_start..byte_end` of the original become
+/// `replacement`.
 ///
-/// Returns the patched source together with each hole's new byte offset, in the
-/// **input's** order. Those offsets matter: `rustc` reports spans against the
-/// patched text, and substituting `()` for a `todo!(...)` shortens the file, so
-/// every hole after the first shifts left. Comparing a diagnostic against the
-/// hole's *original* offset would misattribute it to whichever hole happened to
-/// sit where the shifted bytes landed.
+/// The general form of what a probe does with [`UNIT`] and what a verifier does
+/// with generated code. Both splice text into a source file and then need to
+/// know where each piece landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edit<'a> {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub replacement: &'a str,
+}
+
+/// Splice several non-overlapping edits into `src` in one pass.
 ///
-/// Overlapping or duplicate spans are refused rather than resolved: a caller
-/// that got here with duplicates has a bug, and the splicing below would
-/// silently corrupt the file.
+/// Returns the new source together with each edit's byte offset in it, in the
+/// **input's** order. Those offsets are the point: everything downstream works
+/// in the new text's coordinates, because that is what rustc reports spans
+/// against. Replacements are rarely the same length as what they replace, so
+/// every edit after the first shifts.
+///
+/// Overlapping or duplicate ranges are refused rather than resolved: a caller
+/// that got here with duplicates has a bug, and splicing both would silently
+/// corrupt the file.
 #[allow(clippy::type_complexity)]
-fn patched_source_many(
+pub fn splice_many(
     src: &str,
-    holes: &[&Hole],
+    edits: &[Edit<'_>],
 ) -> std::result::Result<(String, Vec<usize>), String> {
-    for hole in holes {
-        validate_span(src, hole)?;
+    for e in edits {
+        if e.byte_start > e.byte_end {
+            return Err(format!(
+                "edit {}..{} ends before it starts",
+                e.byte_start, e.byte_end
+            ));
+        }
+        if e.byte_end > src.len() {
+            return Err(format!(
+                "edit {}..{} runs past the end of a {} byte file",
+                e.byte_start,
+                e.byte_end,
+                src.len()
+            ));
+        }
+        if !src.is_char_boundary(e.byte_start) || !src.is_char_boundary(e.byte_end) {
+            return Err(format!(
+                "edit {}..{} does not land on character boundaries",
+                e.byte_start, e.byte_end
+            ));
+        }
     }
 
     // Sort by start so splices can be emitted left to right, remembering where
-    // each hole came from so the offsets can be returned in input order.
-    let mut ordered: Vec<(usize, &Hole)> = holes.iter().copied().enumerate().collect();
-    ordered.sort_by_key(|(_, h)| (h.byte_start, h.byte_end));
+    // each edit came from so the offsets can be returned in input order.
+    let mut ordered: Vec<(usize, &Edit<'_>)> = edits.iter().enumerate().collect();
+    ordered.sort_by_key(|(_, e)| (e.byte_start, e.byte_end));
 
     for pair in ordered.windows(2) {
         let (_, a) = pair[0];
         let (_, b) = pair[1];
         if b.byte_start < a.byte_end {
             return Err(format!(
-                "holes at bytes {}..{} and {}..{} overlap, so they cannot be patched together",
+                "edits at bytes {}..{} and {}..{} overlap, so they cannot be spliced together",
                 a.byte_start, a.byte_end, b.byte_start, b.byte_end
             ));
         }
     }
 
-    let mut out = String::with_capacity(src.len() + UNIT.len() * ordered.len());
+    let growth: usize = ordered.iter().map(|(_, e)| e.replacement.len()).sum();
+    let mut out = String::with_capacity(src.len() + growth);
     let mut anchors = vec![0usize; ordered.len()];
     let mut cursor = 0usize;
-    for (position, (_, hole)) in ordered.iter().enumerate() {
-        out.push_str(&src[cursor..hole.byte_start]);
+    for (position, (_, e)) in ordered.iter().enumerate() {
+        out.push_str(&src[cursor..e.byte_start]);
         anchors[position] = out.len();
-        out.push_str(UNIT);
-        cursor = hole.byte_end;
+        out.push_str(e.replacement);
+        cursor = e.byte_end;
     }
     out.push_str(&src[cursor..]);
 
@@ -761,6 +800,32 @@ fn patched_source_many(
         by_input[*input_index] = anchors[position];
     }
     Ok((out, by_input))
+}
+
+/// Replace several non-overlapping holes with [`UNIT`] in one pass.
+///
+/// Returns the patched source together with each hole's new byte offset, in the
+/// **input's** order. See [`splice_many`] for why those offsets matter.
+fn patched_source_many(
+    src: &str,
+    holes: &[&Hole],
+) -> std::result::Result<(String, Vec<usize>), String> {
+    // The hole's span must still hold a `todo!` before it is replaced, and this
+    // is where that check lives: `splice_many` works on raw byte ranges and
+    // cannot know what should be there.
+    for hole in holes {
+        validate_span(src, hole)?;
+    }
+
+    let edits: Vec<Edit<'_>> = holes
+        .iter()
+        .map(|h| Edit {
+            byte_start: h.byte_start,
+            byte_end: h.byte_end,
+            replacement: UNIT,
+        })
+        .collect();
+    splice_many(src, &edits)
 }
 
 /// Group holes by file, splitting off the ones that can never be patched.
@@ -1260,6 +1325,15 @@ impl Prober {
         &self.root
     }
 
+    /// How long to wait for another process's probe lock.
+    ///
+    /// Exposed so the verifier can serialise against probing using the same
+    /// deadline, rather than picking its own and behaving differently under
+    /// contention.
+    pub fn lock_wait(&self) -> Duration {
+        self.options.lock_wait
+    }
+
     /// Ask rustc what type `hole` must have.
     ///
     /// Never leaves the file modified, on any path including panic and timeout.
@@ -1435,6 +1509,15 @@ impl Prober {
                 outcomes[*i] = decide(hole, &self.root, &run, blame, Isolation::Batched);
             }
         }
+    }
+
+    /// Run `cargo check` and collect its diagnostics.
+    ///
+    /// Public so the verifier can reuse this exact invocation — the same cargo
+    /// binary, timeout, `--offline`, target directory and `CARGO_HOME` — instead
+    /// of duplicating the option handling and letting the two drift apart.
+    pub fn check(&self) -> Result<CheckRun> {
+        self.run_check()
     }
 
     /// Run `cargo check` and collect its diagnostics.

@@ -10,6 +10,12 @@ use crate::{agent::Agent, hole::Hole, util::display_rel_path};
 pub const OPEN_MARKER: &str = "<<<HOLE>>>";
 pub const CLOSE_MARKER: &str = "<<<END>>>";
 
+/// How many compiler errors to quote back when asking again for a hole.
+///
+/// Capped because one bad answer can produce a long cascade, and the first few
+/// errors already say what is wrong. The rest would only crowd the prompt.
+pub const MAX_REPORTED_ERRORS: usize = 8;
+
 /// What the probe learned, keyed by hole so `fill` can look it up later.
 ///
 /// A `HashMap` rather than a `Vec` because `fill` reaches a hole's verdict by
@@ -94,6 +100,46 @@ impl<'a> Filler<'a> {
         self.fill_hole_with(hole, None)
     }
 
+    /// Ask again for a hole whose previous answer failed the compile gate.
+    ///
+    /// `errors` are the rustc messages the gate blamed on this hole. They go
+    /// into the prompt as feedback, which is the whole point: a bare retry would
+    /// ask the same question with the same information and tend to get the same
+    /// answer back.
+    ///
+    /// A fresh probe is deliberately *not* run. The expected type is a property
+    /// of the hole and its neighbours, and the neighbours have not changed in a
+    /// way the probe could see -- it patches and restores, so it never observes
+    /// the filled tree. Reusing the caller's expectation keeps the retry cheap.
+    pub fn refill_hole(
+        &self,
+        hole: &Hole,
+        known: Option<&Expectations>,
+        errors: &[String],
+    ) -> Result<(String, u32)> {
+        let expected: Option<&ProbeOutcome> = known.and_then(|k| k.get(&hole.index_key()));
+
+        let mut feedback = String::from(
+            "Your previous answer compiled with errors. Fix it. The compiler reported:\n",
+        );
+        for e in errors.iter().take(MAX_REPORTED_ERRORS) {
+            feedback.push_str("  - ");
+            feedback.push_str(e);
+            feedback.push('\n');
+        }
+        if errors.len() > MAX_REPORTED_ERRORS {
+            feedback.push_str(&format!(
+                "  (and {} more error(s))\n",
+                errors.len() - MAX_REPORTED_ERRORS
+            ));
+        }
+
+        // One round, using the same reply-parsing and retry-on-provider-failure
+        // path as the first attempt, with the compiler's complaint as the seed
+        // feedback.
+        self.ask(hole, expected, Some(&feedback))
+    }
+
     /// As [`Filler::fill_hole`], but reusing a verdict from
     /// [`Filler::probe_all`] when one was supplied for this hole.
     ///
@@ -133,7 +179,21 @@ impl<'a> Filler<'a> {
             }
         };
 
-        let mut feedback: Option<String> = None;
+        self.ask(hole, expected, None)
+    }
+
+    /// Run the attempt loop: ask, parse, retry with feedback until the reply is
+    /// usable or the attempts run out.
+    ///
+    /// `seed` is feedback to include in the *first* prompt, which is how a
+    /// retry after a failed compile gate carries the compiler's complaint.
+    fn ask(
+        &self,
+        hole: &Hole,
+        expected: Option<&ProbeOutcome>,
+        seed: Option<&str>,
+    ) -> Result<(String, u32)> {
+        let mut feedback: Option<String> = seed.map(str::to_string);
         let max_attempts = self.agent.max_attempts();
 
         for attempt in 1..=max_attempts {

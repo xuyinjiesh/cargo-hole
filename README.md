@@ -24,10 +24,13 @@ E0308: expected `Image`, found `()`
 ```
 
 That yields the expected type, the exact span, and real inference results —
-including coercions — for the price of one `cargo check`. **This probe is not
-implemented yet:** `src/prober.rs` is empty and `fill` sends the model only the
-spec text and the hole's syntactic position. `--no-probe` is accepted and
-currently has no effect. See [Current status](#current-status).
+including coercions — for the price of one `cargo check`.
+
+The probe runs batched: every hole in a file is replaced with `()` at once and
+one `cargo check` answers all of them, because each `E0308` carries its own span.
+A verdict the batch cannot settle is re-probed alone, so the batched answer is
+never weaker than the serial one. `--no-probe` turns the whole thing off, and the
+model then gets only the spec text and the hole's syntactic position.
 
 ## Commands
 
@@ -102,8 +105,9 @@ filling 2 hole(s) in . using cli:codex (its own model)
 The header names the agent actually in use. Without `--in-place`, results are
 written to `<root>/.cargo-hole/<relative path>` and the originals are left
 untouched; with it, files are overwritten in place. Files are grouped so each is
-read and written once, and holes within a file are filled from the bottom up so
-earlier edits cannot shift later byte offsets.
+read and written once. All of a file's answers are spliced in a single
+left-to-right pass, which is also what records where each answer landed -- needed
+to tell which hole a compile error belongs to.
 
 A hole that cannot be filled is reported on stderr and does **not** abandon the
 rest of the file:
@@ -115,8 +119,39 @@ warning: skipping /tmp/demo/src/lib.rs:3: /tmp/demo/src/lib.rs:3 is pinned, so i
 ```
 
 So `not filled` counts holes that were attempted and refused; `cached` counts
-holes answered from the ledger below; `skipped` is reserved but currently always
-0.
+holes answered from the ledger below; `skipped` counts pinned and unresolvable
+holes, which are never attempted.
+
+### The compile gate
+
+Before anything is recorded, the generated tree is put through a compile gate.
+The subtlety is that a plain `cargo check` of the crate root would never fail:
+a hole is `todo!()`, whose type is `!` and coerces to anything, so a crate full
+of unelaborated holes compiles cleanly — and without `--in-place` the real source
+is never modified, so checking the root checks the *unfilled* tree. The gate
+therefore patches every generated file into place, runs one `cargo check`, and
+restores every file byte-for-byte.
+
+If the tree does not compile, nothing from that run enters the ledger, and the
+errors are mapped back to the holes whose generated code they land in:
+
+```
+warning: /tmp/demo/src/lib.rs:6: E0308: mismatched types: expected `i64`, found `&str`
+re-asked for 1 answer(s) across 1 extra round(s) after the compile gate rejected them
+```
+
+`fill` re-asks for exactly those holes, quoting rustc at them, and re-gates.
+Errors that land outside every generated region are the crate's own — they are
+reported and not retried, since no answer can fix them.
+
+Nothing is written until the gate accepts. That ordering matters most for
+`--in-place`, where a write *is* the user's source: writing first and undoing on
+rejection would leave a window in which the file on disk holds code that does not
+compile. Because the write happens last, a rejected run leaves the source exactly
+as it found it, and there is nothing to roll back.
+
+`--no-verify` skips the gate. Because the ledger's one guarantee is that every
+entry is code the gate accepted, a run with `--no-verify` **records nothing**.
 
 ### The ledger
 
@@ -143,10 +178,23 @@ the wrong code into a file.
 
 Two properties are worth knowing:
 
-- **Nothing is recorded until the run finishes.** Answers are held in memory and
-  written after every artifact has landed, so an interrupted run never leaves
-  behind a ledger entry for code that was never written. This is also where the
-  compile gate will go once `src/verifier.rs` exists.
+- **Nothing is recorded until the generated tree has compiled.** Answers are
+  held in memory, the whole tree is put through the compile gate
+  (`src/verifier.rs`), and only then are the artifacts written and the accepted
+  answers recorded. So an interrupted run never leaves behind a ledger entry for
+  code that was never written, and *nothing* in the ledger is code that was never
+  compiled. A run that fails the gate records nothing, which is why the next run
+  has to generate those answers again -- see `--no-verify` below.
+- **The gate is per tree, not per hole.** One hole's answer can depend on what
+  another hole was filled with, so "this hole compiled" is not a property a
+  single hole can have. One `cargo check` covers the whole generated tree, and a
+  failure means no answer from that run is recorded.
+- **A rejection names the answers at fault.** Errors are mapped back to the hole
+  whose generated code they land in, so `fill` can re-ask for exactly those
+  holes -- quoting rustc at them -- instead of discarding the whole run's work.
+  Errors that land outside every generated region belong to the crate as it
+  already was; they are reported rather than retried, because no answer can fix
+  them.
 - **A pin is never routed around.** A hole that has been pinned is regenerated
   (i.e. refused), never replayed from the ledger, even if an earlier run cached
   an answer for it before it was pinned. Otherwise the cache would quietly
@@ -250,31 +298,25 @@ say so — which is exactly the case the probe exists to cover.
 
 Implemented: hole discovery and listing, spec parsing, the `// hole:pinned`
 marker, position detection, the `codex` agent, retry-on-failure, config and
-environment layering, writing results in place or to `.cargo-hole/`, and the
-ledger that lets a repeated `fill` skip the model entirely.
+environment layering, writing results in place or to `.cargo-hole/`, the ledger
+that lets a repeated `fill` skip the model entirely, the batched type probe, and
+the compile gate that decides what may enter the ledger.
 
 Not implemented yet, and therefore not relied upon by anything:
 
-- **The type probe.** `src/prober.rs` is empty, so no expected type reaches the
-  model and there is no `cargo hole type` command. `--no-probe` is inert.
-- **The compile gate.** `src/verifier.rs` is empty. `fill` splices whatever the
-  model returns; `--no-verify` is inert. A bad reply is written out verbatim.
-  Because there is no gate, the ledger currently records every answer a `fill`
-  produced. The invariant it documents -- that a ledger entry is code the gate
-  accepted -- holds trivially until `verifier.rs` lands, at which point entries
-  written before it did may be answers nothing ever compiled.
 - **`cargo hole restore`.** The subcommand exists and panics with
-  `not implemented` (exit 101). There is no `.cargo-hole.bak`, no restore guard
-  and no probe lock.
-- **`--at <file>:<line>`** and **`--timeout <seconds>`.** Accepted by the CLI and
-  ignored; `--at` fills every hole anyway.
+  `not implemented` (exit 101). The probe lock, the `.cargo-hole.bak` files and
+  `restore_leftovers` all exist and are tested, but nothing calls the function
+  from the CLI.
+- **`--at <file>:<line>`.** Accepted by the CLI and ignored; `--at` fills every
+  hole anyway. (`--timeout` does now reach both the probe and the gate.)
 - **Provider pluggability.** `docs/providers.md`, a `Provider` trait, a `script`
   provider and the `[model] provider/command/args` keys do not exist — the only
   agent is the `codex` CLI.
 - **`Hole::hole_id`**, a blake3 hash over spec, signature, impl context,
   position and edition, is implemented but never called by anything.
-- **`libc`** is declared for process-group kills that `--timeout` would need; no
-  code uses it.
+- **`cargo hole type`**, a command that would report a hole's expected type
+  without filling it. The probe can answer this; nothing exposes it yet.
 
 ## Development
 
@@ -306,6 +348,6 @@ need no network, and there is no ignored/live-provider test group.
 | `agent.rs` | config file and `CARGO_HOLE_*` layering, agent selection |
 | `agent/codex.rs` | driving `codex exec --json`, parsing its JSONL events |
 | `util.rs` | file walk, byte-level scanner (delimiters, comments, strings), line/column |
-| `prober.rs` | empty; the type probe belongs here |
-| `verifier.rs` | empty; the compile gate belongs here |
+| `prober.rs` | the type probe: patch a hole with `()`, read the `E0308`, restore |
+| `verifier.rs` | the compile gate: check the whole generated tree, blame the answers at fault |
 | `main.rs`, `lib.rs` | thin entry point and module list |
