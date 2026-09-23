@@ -310,6 +310,38 @@ impl Shadow {
             )
         })
     }
+
+    /// Run the generated tree's binary, with the *crate's* directory as the
+    /// working directory.
+    ///
+    /// `cargo run` gives the program the directory cargo was invoked in, so
+    /// running it inside the build tree would hand the program the tree instead of
+    /// the user's crate: a relative path the program opens (`./data/input.txt`,
+    /// `include_str!` at runtime, a config beside the manifest) would resolve
+    /// against a copy. The copy usually contains those files, which is what makes
+    /// this quiet rather than loud -- it works until the program writes, or until
+    /// the two diverge.
+    ///
+    /// So the working directory is deliberately *not* `self.dir`; cargo is pointed
+    /// at the build tree's manifest instead. Output still lands in the tree's
+    /// `target/`, which keeps the real `target/` untouched alongside the real
+    /// source.
+    pub fn run(&self, options: &ProberOptions, forwarded: &[String]) -> Result<ExitStatus> {
+        let manifest = self.dir.join("Cargo.toml");
+        let mut cmd = options.cargo_command("run");
+        // Before `forwarded`, so a later `--manifest-path` from the user wins and
+        // cargo reports its own error rather than silently running the wrong tree.
+        cmd.arg("--manifest-path").arg(&manifest);
+        cmd.args(forwarded);
+        cmd.current_dir(&self.root);
+        cmd.status().with_context(|| {
+            format!(
+                "cannot run `{} run` for {}; is cargo on PATH?",
+                options.cargo,
+                self.root.display()
+            )
+        })
+    }
 }
 
 /// Make `path` absolute and lexically free of `.` and `..`, without touching the

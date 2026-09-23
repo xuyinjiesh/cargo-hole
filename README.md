@@ -46,6 +46,8 @@ cargo hole fill  --path .                 # fill holes, writing to .cargo-hole/
 cargo hole fill  --path . --in-place      # ...and write back over the originals
 cargo hole build --path .                 # build the generated tree, source untouched
 cargo hole build --path . --release       # flags after the command go to cargo
+cargo hole run   --path .                 # build and run the generated tree
+cargo hole run   --path . -- a b          # arguments after `--` go to the program
 ```
 
 Every command takes `--path`, the crate root to work on (default `.`). It is
@@ -249,6 +251,58 @@ unimplemented.
 Add `.cargo-hole/build/` to your `.gitignore`: it is a full second copy of the
 crate plus its own `target/`.
 
+### `run`
+
+`run` assembles the same tree and then runs it, like `cargo run`:
+
+```
+$ cargo hole run --path .
+assembled .cargo-hole/build at /tmp/demo/.cargo-hole/build (...)
+
+running .cargo-hole/build with cargo
+      Running `.cargo-hole/build/target/debug/demo`
+```
+
+It is not `build && ./target/debug/demo`, for two reasons.
+
+**The working directory.** `cargo run` gives the program the directory cargo was
+invoked in. Running it *inside* the build tree would therefore hand the program
+the tree instead of your crate, so a relative path it opens — `./data/input.txt`,
+a config next to the manifest, anything resolved at runtime — would silently point
+at a copy. The copy usually contains those files, which is what makes this quiet
+rather than loud: it works until the program writes, or until the two diverge.
+
+So `run` keeps the crate's directory as the working directory and points cargo at
+the tree's manifest instead. Output still lands in the tree's `target/`, so your
+real `target/` stays untouched, exactly as with `build`.
+
+**Target selection.** `cargo run` knows which target `--bin`, `-p` or `--example`
+selected and where the result landed. Locating the binary by hand would be a
+second implementation of cargo's own rules, and one that quietly disagrees the
+moment a profile or target layout changes.
+
+The program's exit status reaches the caller unchanged, so a script sees what
+`cargo run` would have told it:
+
+```
+$ cargo hole run --path . ; echo $?
+3
+```
+
+`--` separates the two kinds of argument, matching `cargo run`:
+
+```
+cargo hole run --path . --release --bin app   # these go to cargo
+cargo hole run --path . -- --nocapture        # these go to the program
+```
+
+`--help` after the separator belongs to the program, not to `cargo hole` — which
+is what you want when the program has its own flags. The other spelling works too:
+anything after an explicit `--` is re-emitted to cargo behind a `--` of its own,
+since `cargo run alpha` would otherwise read `alpha` as a cargo argument and fail.
+
+`--clean`, `--build-dir` and `--dry-run` behave as they do for `build`.
+
 ### The ledger
 
 Everything `cargo hole` writes lives under one directory, and each thing in it
@@ -412,8 +466,8 @@ Implemented: hole discovery and listing, spec parsing, the `// hole:pinned`
 marker, position detection, the `codex` agent, retry-on-failure, config and
 environment layering, writing results in place or to `.cargo-hole/`, the ledger
 that lets a repeated `fill` skip the model entirely, the batched type probe, the
-compile gate that decides what may enter the ledger, and `build`, which compiles
-the generated tree in a shadow copy of the crate.
+compile gate that decides what may enter the ledger, `build`, which compiles the
+generated tree in a shadow copy of the crate, and `run`, which runs it.
 
 Not implemented yet, and therefore not relied upon by anything:
 
@@ -463,5 +517,5 @@ need no network, and there is no ignored/live-provider test group.
 | `util.rs` | file walk, byte-level scanner (delimiters, comments, strings), line/column |
 | `prober.rs` | the type probe: patch a hole with `()`, read the `E0308`, restore |
 | `verifier.rs` | the compile gate: check the whole generated tree, blame the answers at fault |
-| `shadow.rs` | the `build` shadow tree: mirror the crate, link the artifacts over it, run cargo there |
+| `shadow.rs` | the shadow tree behind `build`/`run`: mirror the crate, link the artifacts over it, run cargo there |
 | `main.rs`, `lib.rs` | thin entry point and module list |

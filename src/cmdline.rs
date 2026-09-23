@@ -14,7 +14,7 @@ use crate::{
     filler::{Expectations, Filler},
     hole::Hole,
     prober::ProberOptions,
-    shadow::Shadow,
+    shadow::{Shadow, SyncStats},
     storage::{PATCH_DIR, STORE_DIR, Storage},
     util::display_rel_path,
 };
@@ -38,6 +38,8 @@ enum Command {
     Fill(FillArgs),
     /// Build the generated tree in `.cargo-hole/` without touching the source.
     Build(BuildArgs),
+    /// Assemble the generated tree and run it, like `cargo run`.
+    Run(RunArgs),
     /// Restore any file left patched by an interrupted probe.
     Restore(RestoreArgs),
 }
@@ -136,6 +138,64 @@ struct BuildArgs {
 }
 
 #[derive(Parser, Debug)]
+struct RunArgs {
+    /// Path to the crate root (defaults to the current directory).
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+    /// Where to assemble the build tree. Defaults to `<root>/.cargo-hole/build`.
+    ///
+    /// It has to be somewhere the crate root is not inside, because `--clean`
+    /// deletes it.
+    #[arg(long)]
+    build_dir: Option<PathBuf>,
+    /// Delete the build tree first, so the build starts from scratch.
+    #[arg(long)]
+    clean: bool,
+    /// Assemble the tree and report what it would contain, then stop short of
+    /// running cargo.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Flags for `cargo run`, up to an explicit `--`.
+    ///
+    /// These go to cargo, before its own separator, so `cargo hole run --release
+    /// --bin app` works. A literal `--` splits the two: what follows belongs to
+    /// the *program*, matching `cargo run -- args`.
+    #[arg(allow_hyphen_values = true, num_args = 0..)]
+    before_separator: Vec<String>,
+
+    /// Arguments for the program itself, the conventional way.
+    ///
+    /// `cargo hole run a b` and `cargo hole run -- a b` both mean the same thing;
+    /// this field is what makes the first spelling work.
+    #[arg(last = true, allow_hyphen_values = true)]
+    after_separator: Vec<String>,
+}
+
+impl RunArgs {
+    /// Split the trailing arguments into cargo flags and program arguments.
+    ///
+    /// clap hands back the literal `--` inside `before_separator` rather than
+    /// consuming it, so the split has to happen here. Cargo needs a `--` of its own
+    /// before the program's arguments, which the caller re-inserts: without it,
+    /// `cargo run alpha` would read `alpha` as one of its own and fail.
+    fn split(&self) -> (Vec<String>, Vec<String>) {
+        let mut cargo = self.before_separator.clone();
+        let mut program = self.after_separator.clone();
+
+        if let Some(at) = cargo.iter().position(|a| a == "--") {
+            let tail = cargo.split_off(at);
+            // `split_off` leaves the separator at the head of `tail`; drop it.
+            let mut from_tail = tail[1..].to_vec();
+            // These were written before any second separator, so they come first.
+            from_tail.extend(program);
+            program = from_tail;
+        }
+        (cargo, program)
+    }
+}
+
+#[derive(Parser, Debug)]
 struct RestoreArgs {
     /// Path to the crate root (defaults to the current directory).
     #[arg(long, default_value = ".")]
@@ -159,6 +219,7 @@ pub fn cargo_hole_cli_main() -> Result<()> {
         Command::List(args) => list(args),
         Command::Fill(args) => fill(args),
         Command::Build(args) => build(args),
+        Command::Run(args) => run(args),
         Command::Restore(_args) => unimplemented!(),
     }
 }
@@ -343,18 +404,50 @@ fn build(args: BuildArgs) -> Result<()> {
     let root = canonicalize(&args.path)
         .with_context(|| format!("fail to canonicalize {}", args.path.display()))?;
 
-    let shadow = Shadow::new(root.clone(), args.build_dir)?;
+    let (shadow, _) = assemble(&root, args.build_dir, args.clean, args.dry_run)?;
 
-    if args.clean {
+    if args.dry_run {
+        println!(
+            "\nwould run `{} build {}` in {}",
+            build_options().cargo,
+            args.cargo_args.join(" "),
+            shadow.dir().display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\nbuilding {} with cargo",
+        display_rel_path(&root, shadow.dir())
+    );
+    exit_with(shadow.build(&build_options(), &args.cargo_args)?);
+    Ok(())
+}
+
+/// Assemble the build tree and report what went into it.
+///
+/// Shared by `build` and `run`, which differ only in what cargo is asked to do
+/// afterwards. The tree, the two warnings and the exit-status contract are the
+/// same, and a `run` that assembled differently from a `build` would be a bug
+/// waiting to be reported as one.
+fn assemble(
+    root: &Path,
+    build_dir: Option<PathBuf>,
+    clean: bool,
+    dry_run: bool,
+) -> Result<(Shadow, SyncStats)> {
+    let shadow = Shadow::new(root.to_path_buf(), build_dir)?;
+
+    if clean {
         shadow.clean()?;
-        println!("removed {}", display_rel_path(&root, shadow.dir()));
+        println!("removed {}", display_rel_path(root, shadow.dir()));
     }
 
     let stats = shadow.sync()?;
 
     println!(
         "assembled {} at {} ({} file(s) copied, {} reused, {} artifact(s) overlaid)",
-        display_rel_path(&root, shadow.dir()),
+        display_rel_path(root, shadow.dir()),
         shadow.dir().display(),
         stats.copied,
         stats.reused,
@@ -365,12 +458,12 @@ fn build(args: BuildArgs) -> Result<()> {
     // are links, those paths *are* the generated code, and saying so prevents a
     // user from editing the wrong copy -- or from assuming their fix was ignored
     // when a copy would have reverted it.
-    if stats.linked > 0 && !args.dry_run {
+    if stats.linked > 0 && !dry_run {
         println!(
             "note: {} artifact(s) are linked into {}, so edits to the paths rustc \
              reports are edits to the generated code",
             stats.linked,
-            display_rel_path(&root, &root.join(STORE_DIR).join(PATCH_DIR))
+            display_rel_path(root, &root.join(STORE_DIR).join(PATCH_DIR))
         );
     }
 
@@ -388,29 +481,65 @@ fn build(args: BuildArgs) -> Result<()> {
         );
     }
 
+    Ok((shadow, stats))
+}
+
+/// Assemble the tree, then run it.
+///
+/// `cargo run` rather than building and locating a binary by hand: cargo knows
+/// which target `--bin`/`--example` selected and where the result landed, and
+/// re-deriving that would be a second implementation of cargo's own rules -- one
+/// that would quietly disagree the moment a profile or a target layout changed.
+fn run(args: RunArgs) -> Result<()> {
+    let root = canonicalize(&args.path)
+        .with_context(|| format!("fail to canonicalize {}", args.path.display()))?;
+
+    // Split before `assemble` consumes `build_dir`, which would leave `args`
+    // partially moved and unusable for `split`.
+    let (cargo_args, program_args) = args.split();
+    let (shadow, _) = assemble(&root, args.build_dir, args.clean, args.dry_run)?;
+
+    // Cargo needs its own `--` before the program's arguments, or `cargo run foo`
+    // would read `foo` as one of its own and fail with a usage error.
+    let mut forwarded = cargo_args;
+    if !program_args.is_empty() {
+        forwarded.push("--".to_string());
+        forwarded.extend(program_args.iter().cloned());
+    }
+
     if args.dry_run {
+        let rendered = std::iter::once("run")
+            .chain(forwarded.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
         println!(
-            "\nwould run `{} build {}` in {}",
+            "\nwould run `{} {}` from {}",
             build_options().cargo,
-            args.cargo_args.join(" "),
-            shadow.dir().display()
+            rendered,
+            root.display()
         );
         return Ok(());
     }
 
     println!(
-        "\nbuilding {} with cargo",
+        "\nrunning {} with cargo",
         display_rel_path(&root, shadow.dir())
     );
-    let status = shadow.build(&build_options(), &args.cargo_args)?;
-
-    if !status.success() {
-        // Propagate the status, so a script wrapping this command sees the same
-        // answer it would from `cargo build` itself.
-        let code = status.code().unwrap_or(1);
-        std::process::exit(code);
-    }
+    exit_with(shadow.run(&build_options(), &forwarded)?);
     Ok(())
+}
+
+/// Hand the child's status back to the shell.
+///
+/// Propagated rather than returned as an `Err`, because a program that exits
+/// nonzero -- or a tree that does not compile -- is a normal outcome the user asked
+/// to observe, not a failure of this command. A script wrapping `cargo hole run`
+/// then sees exactly what `cargo run` would have told it.
+fn exit_with(status: std::process::ExitStatus) {
+    if !status.success() {
+        // No code means killed by a signal; 1 is the closest honest answer.
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 fn list(args: ListArgs) -> Result<()> {
