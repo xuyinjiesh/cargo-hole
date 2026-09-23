@@ -6,6 +6,9 @@
 /tests/fixtures/*/Cargo.lock
 *.cargo-hole.bak
 .cargo-hole.probe.lock
+# The `cargo hole build` shadow tree: a full copy of the crate plus its own
+# target directory, regenerated on demand and never worth committing
+.cargo-hole/build/
 /.npm/
 # Scratch crates built by hand while checking how cargo behaves
 /.probe-test/

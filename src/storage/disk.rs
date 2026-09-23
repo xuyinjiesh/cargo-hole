@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
 
-use super::{Entry, LEDGER_FILE, SCHEMA, STORE_DIR};
+use super::{Entry, LEDGER_FILE, PATCH_DIR, SCHEMA, STORE_DIR};
 
 /// Counter for unique temporary filenames within this process.
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
@@ -100,7 +100,7 @@ impl DiskCache {
                 );
             }
         }
-        Ok(self.dir.join(rel))
+        Ok(self.dir.join(PATCH_DIR).join(rel))
     }
 
     /// Write `src` as the artifact for `file`, replacing any earlier one.
@@ -260,7 +260,12 @@ mod tests {
         let path = cache
             .artifact_path(&root.join("src/thing/mod.rs"))
             .expect("mapped");
-        assert_eq!(path, root.join(STORE_DIR).join("src/thing/mod.rs"));
+        assert_eq!(
+            path,
+            root.join(STORE_DIR)
+                .join(PATCH_DIR)
+                .join("src/thing/mod.rs")
+        );
     }
 
     #[test]
@@ -309,7 +314,7 @@ mod tests {
         cache.write_artifact(&file, "one").expect("write");
         cache.write_artifact(&file, "two").expect("write");
 
-        let dir = root.join(STORE_DIR).join("src");
+        let dir = root.join(STORE_DIR).join(PATCH_DIR).join("src");
         let names: Vec<String> = std::fs::read_dir(&dir)
             .expect("list the store")
             .flatten()

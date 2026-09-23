@@ -31,7 +31,6 @@ pub fn column_of(src: &str, byte: usize) -> usize {
     src[line_start..byte].chars().count() + 1
 }
 
-
 pub fn rust_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     walk(root, &mut out, 0)?;
@@ -57,12 +56,23 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
+        // `file_type` describes the link itself, not what it points at: a
+        // symlinked source file reports `is_symlink`, not `is_file`, so a plain
+        // `is_file()` check would skip it. Follow it for files, because rustc
+        // follows it too when it resolves `mod`, so a hole behind a symlink is a
+        // hole rustc will compile. `cargo hole build` depends on this: it
+        // overlays artifacts as symlinks, and without the follow those files
+        // would be invisible here and the "holes are still open" report would
+        // silently read zero -- the one outcome that warning exists to prevent.
+        // Directory symlinks stay skipped, which is what keeps the depth guard
+        // meaningful.
+        let is_file = ft.is_file() || (ft.is_symlink() && path.is_file());
         if ft.is_dir() {
             if name == "target" || name == "node_modules" {
                 continue;
             }
             walk(&path, out, depth + 1)?;
-        } else if ft.is_file() && path.extension().is_some_and(|e| e == "rs") {
+        } else if is_file && path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }

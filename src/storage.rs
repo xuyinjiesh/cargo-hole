@@ -3,9 +3,12 @@
 //! Two things live under `<root>/.cargo-hole/`:
 //!
 //! - **Artifacts**: one generated `.rs` per source file that had holes,
-//!   mirroring the source tree (`src/lib.rs` -> `.cargo-hole/src/lib.rs`). The
-//!   real source is never touched, so every hole keeps its `todo!("spec: ...")`
-//!   and its byte offsets stay valid across runs.
+//!   mirroring the source tree (`src/lib.rs` -> `.cargo-hole/patch/src/lib.rs`).
+//!   They live in a `patch/` subdirectory so that the store's top level holds
+//!   only the ledger and the lock, and so that generated code is never confused
+//!   with `build/`, the disposable shadow tree that `cargo hole build` derives
+//!   from it. The real source is never touched, so every hole keeps its
+//!   `todo!("spec: ...")` and its byte offsets stay valid across runs.
 //! - The **ledger**: `ledger.jsonl`, one JSON object per line, mapping a hole to
 //!   the code that was generated for it.
 //!
@@ -53,6 +56,16 @@ use disk::DiskCache;
 
 /// Directory holding artifacts and the ledger, relative to the crate root.
 pub const STORE_DIR: &str = ".cargo-hole";
+
+/// Name of the directory inside [`STORE_DIR`] that holds the generated code.
+///
+/// Kept separate from [`STORE_DIR`] itself so that the store's top level holds
+/// only the ledger and the lock, and so that `build`'s shadow tree -- which is
+/// derived, disposable output -- can never be confused with the generated code,
+/// which is the product. Renaming this is a layout change: old artifacts left at
+/// `.cargo-hole/src/` are not silently ignored, because ignoring them would build
+/// an all-`todo!()` tree that still compiles.
+pub const PATCH_DIR: &str = "patch";
 
 /// Name of the append-only ledger inside [`STORE_DIR`].
 pub const LEDGER_FILE: &str = "ledger.jsonl";

@@ -176,7 +176,7 @@ fn a_rejected_answer_is_never_written_as_an_artifact() {
         "unexpected: {stderr}"
     );
 
-    let artifact = fx.dir.join(".cargo-hole/src/lib.rs");
+    let artifact = fx.dir.join(".cargo-hole/patch/src/lib.rs");
     if artifact.exists() {
         let text = std::fs::read_to_string(&artifact).unwrap();
         assert!(

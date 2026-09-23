@@ -1171,16 +1171,19 @@ impl ProberOptions {
         }
     }
 
-    /// The `cargo check` invocation, without running it.
-    fn check_command(&self, root: &Path) -> Command {
+    /// A cargo subcommand invocation, without running it.
+    ///
+    /// This is the shared spine every caller needs: the cargo binary, `--offline`
+    /// and `--target-dir`, and a `CARGO_HOME` override set on the *child* rather
+    /// than the process (which is what makes this usable when `~/.cargo` is
+    /// read-only, and what edition 2024's unsafe `set_var` rules out anyway).
+    ///
+    /// stdio and the working directory are left to the caller, because the uses
+    /// differ: a check wants piped JSON to parse, whereas a build wants the user
+    /// to watch it.
+    pub(crate) fn cargo_command(&self, subcommand: &str) -> Command {
         let mut cmd = Command::new(&self.cargo);
-        cmd.arg("check")
-            .arg("--message-format=json")
-            .arg("--quiet")
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.arg(subcommand);
 
         if let Some(dir) = &self.target_dir {
             cmd.arg("--target-dir").arg(dir);
@@ -1191,6 +1194,18 @@ impl ProberOptions {
         if let Some(home) = &self.cargo_home {
             cmd.env("CARGO_HOME", home);
         }
+        cmd
+    }
+
+    /// The `cargo check` invocation, without running it.
+    fn check_command(&self, root: &Path) -> Command {
+        let mut cmd = self.cargo_command("check");
+        cmd.arg("--message-format=json")
+            .arg("--quiet")
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd
     }
 }

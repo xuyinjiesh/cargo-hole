@@ -13,7 +13,7 @@
 //! The reason is the trick the whole tool rests on. A hole is `todo!("spec:
 //! ...")`, whose type is `!`, which coerces to every type, so a crate full of
 //! unelaborated holes compiles cleanly. In the default (non `--in-place`) mode
-//! `fill` writes its answers to `<root>/.cargo-hole/src/lib.rs` and never touches
+//! `fill` writes its answers to `<root>/.cargo-hole/patch/src/lib.rs` and never touches
 //! the real source, so a check of the crate root compiles the *original*,
 //! still-`todo!()` tree, and passes no matter what the model returned.
 //!

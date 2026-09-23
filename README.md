@@ -44,9 +44,11 @@ cargo hole list  --path . --file lib.rs   # only holes in `lib.rs`
 cargo hole list  --path . --fail-on-unelaborated   # exit 1 if any hole remains
 cargo hole fill  --path .                 # fill holes, writing to .cargo-hole/
 cargo hole fill  --path . --in-place      # ...and write back over the originals
+cargo hole build --path .                 # build the generated tree, source untouched
+cargo hole build --path . --release       # flags after the command go to cargo
 ```
 
-Both commands take `--path`, the crate root to work on (default `.`). It is
+Every command takes `--path`, the crate root to work on (default `.`). It is
 canonicalised, and unreadable paths are a fatal error.
 
 ### `list`
@@ -103,7 +105,7 @@ filling 2 hole(s) in . using cli:codex (its own model)
 ```
 
 The header names the agent actually in use. Without `--in-place`, results are
-written to `<root>/.cargo-hole/<relative path>` and the originals are left
+written to `<root>/.cargo-hole/patch/<relative path>` and the originals are left
 untouched; with it, files are overwritten in place. Files are grouped so each is
 read and written once. All of a file's answers are spliced in a single
 left-to-right pass, which is also what records where each answer landed -- needed
@@ -153,7 +155,117 @@ as it found it, and there is nothing to roll back.
 `--no-verify` skips the gate. Because the ledger's one guarantee is that every
 entry is code the gate accepted, a run with `--no-verify` **records nothing**.
 
+### `build`
+
+`fill` proves the generated code *type-checks*. `build` goes further: it compiles
+the generated tree for real, so you can run it, test it, or hand its binary to
+someone.
+
+```
+$ cargo hole build --path .
+assembled .cargo-hole/build at /tmp/demo/.cargo-hole/build (4 file(s) copied, 0 reused, 2 artifacts overlaid)
+
+building .cargo-hole/build with cargo
+   Compiling demo v0.1.0 (/tmp/demo/.cargo-hole/build)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.82s
+```
+
+The reason this is a copy rather than a `cd .cargo-hole && cargo build` is that
+**`.cargo-hole/` is not a crate.** It holds one generated `.rs` per source file
+that *had a hole*, and nothing else — no `Cargo.toml`, and no file for a module
+that had no holes. Building inside it cannot work.
+
+So `build` mirrors the crate into `<root>/.cargo-hole/build/`, lays the artifacts
+over the copy, and runs cargo there. The user's source is never opened for
+writing, so there is no patch-and-restore window: a build can run for minutes,
+be interrupted, and leave a binary behind, and none of that can touch the real
+crate. That is why `build` does not reuse the gate's patch/restore machinery —
+for a check that lasts seconds it is a fair trade, and for a build it is not.
+
+Files whose contents already match are not rewritten, which keeps their mtimes
+and therefore keeps cargo's incremental cache alive. A second `build` is
+effectively free:
+
+```
+assembled .cargo-hole/build at /tmp/demo/.cargo-hole/build (0 file(s) copied, 4 reused, 2 artifacts overlaid)
+
+building .cargo-hole/build with cargo
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+```
+
+#### The overlay is a symlink
+
+Artifacts are not copied into the build tree — they are **linked** to
+`.cargo-hole/patch/`. That matters because rustc reports errors against paths
+inside the tree it compiled:
+
+```
+error[E0599]: no method named `parse` found for type `Value`
+ --> /tmp/demo/.cargo-hole/build/src/util.rs:8:9
+```
+
+With a copy, that path names a duplicate. A user opens exactly the file rustc
+told them about, fixes it, rebuilds — and the next `sync` silently overwrites the
+edit with the patch tree's version. The fix vanishes, and nothing explains why.
+
+With a link, both names are the same file. Editing the reported path edits the
+generated code, and cargo's mtime check sees it, so the fix survives the rebuild.
+`build` says when this applies:
+
+```
+note: 2 artifact(s) are linked into .cargo-hole/patch, so edits to the paths rustc
+reports are edits to the generated code
+```
+
+Where symlinks are unavailable — a filesystem without them, or Windows without
+the privilege — `build` falls back to copying and works identically, except that
+edits then belong in `.cargo-hole/patch/`. The fallback is silent, because
+warning on every run about a property of the user's filesystem would be noise.
+
+`--clean` remains safe: `remove_dir_all` deletes the links, never their targets,
+so the generated code is untouched.
+
+Anything after the command goes to cargo unchanged, so `cargo hole build
+--release`, `--features foo` and `-p member` all work without `cargo hole`
+knowing about them. `--dry-run` assembles the tree and prints what it *would*
+run; `--clean` deletes the tree first; `--build-dir` moves it.
+
+A build that fails exits with cargo's status, so wrapping this in a script gives
+the same answer `cargo build` would.
+
+One caveat worth knowing: an unelaborated hole is still `todo!()`, whose type is
+`!`, so a crate full of open holes **compiles**. `build` says so explicitly
+rather than reporting a clean success:
+
+```
+warning: 2 hole(s) are still unelaborated in the build tree; run `cargo hole fill` first
+```
+
+For the same reason, if `build` ever found generated code it could not read — an
+older `.cargo-hole/src/` layout, say — it refuses rather than building the crate
+as-is, which would compile perfectly and quietly run with every hole
+unimplemented.
+
+Add `.cargo-hole/build/` to your `.gitignore`: it is a full second copy of the
+crate plus its own `target/`.
+
 ### The ledger
+
+Everything `cargo hole` writes lives under one directory, and each thing in it
+has one job:
+
+```
+.cargo-hole/
+├── patch/          generated code, mirroring the source tree
+│   └── src/lib.rs
+├── ledger.jsonl    every answer the compile gate accepted
+├── .cargo-hole.probe.lock
+└── build/          the shadow tree (disposable; safe to delete)
+```
+
+`patch/` holds the product; `build/` is derived from it and can be deleted at any
+time — the next `build` recreates it. Keeping them apart means no command has to
+guess which one it is looking at.
 
 A second `fill` of an unchanged crate costs nothing:
 
@@ -299,8 +411,9 @@ say so — which is exactly the case the probe exists to cover.
 Implemented: hole discovery and listing, spec parsing, the `// hole:pinned`
 marker, position detection, the `codex` agent, retry-on-failure, config and
 environment layering, writing results in place or to `.cargo-hole/`, the ledger
-that lets a repeated `fill` skip the model entirely, the batched type probe, and
-the compile gate that decides what may enter the ledger.
+that lets a repeated `fill` skip the model entirely, the batched type probe, the
+compile gate that decides what may enter the ledger, and `build`, which compiles
+the generated tree in a shadow copy of the crate.
 
 Not implemented yet, and therefore not relied upon by anything:
 
@@ -350,4 +463,5 @@ need no network, and there is no ignored/live-provider test group.
 | `util.rs` | file walk, byte-level scanner (delimiters, comments, strings), line/column |
 | `prober.rs` | the type probe: patch a hole with `()`, read the `E0308`, restore |
 | `verifier.rs` | the compile gate: check the whole generated tree, blame the answers at fault |
+| `shadow.rs` | the `build` shadow tree: mirror the crate, link the artifacts over it, run cargo there |
 | `main.rs`, `lib.rs` | thin entry point and module list |

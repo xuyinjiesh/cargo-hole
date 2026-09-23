@@ -14,7 +14,8 @@ use crate::{
     filler::{Expectations, Filler},
     hole::Hole,
     prober::ProberOptions,
-    storage::Storage,
+    shadow::Shadow,
+    storage::{PATCH_DIR, STORE_DIR, Storage},
     util::display_rel_path,
 };
 #[derive(Parser, Debug)]
@@ -35,6 +36,8 @@ enum Command {
     List(ListArgs),
     /// Implement holes using a configured model, verifying each with rustc.
     Fill(FillArgs),
+    /// Build the generated tree in `.cargo-hole/` without touching the source.
+    Build(BuildArgs),
     /// Restore any file left patched by an interrupted probe.
     Restore(RestoreArgs),
 }
@@ -106,6 +109,33 @@ struct FillArgs {
 }
 
 #[derive(Parser, Debug)]
+struct BuildArgs {
+    /// Path to the crate root (defaults to the current directory).
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+    /// Where to assemble the build tree. Defaults to `<root>/.cargo-hole/build`.
+    ///
+    /// It has to be somewhere the crate root is not inside, because `--clean`
+    /// deletes it.
+    #[arg(long)]
+    build_dir: Option<PathBuf>,
+    /// Delete the build tree first, so the build starts from scratch.
+    #[arg(long)]
+    clean: bool,
+    /// Assemble the tree and report what it would contain, then stop short of
+    /// running cargo.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Everything after this point is handed to `cargo build` unchanged, so
+    /// `cargo hole build --release --features foo` works without `cargo hole`
+    /// having to know every cargo flag. `--` still works as an explicit
+    /// separator for anything that would otherwise be read as one of ours.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cargo_args: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
 struct RestoreArgs {
     /// Path to the crate root (defaults to the current directory).
     #[arg(long, default_value = ".")]
@@ -128,6 +158,7 @@ pub fn cargo_hole_cli_main() -> Result<()> {
     match cli.command {
         Command::List(args) => list(args),
         Command::Fill(args) => fill(args),
+        Command::Build(args) => build(args),
         Command::Restore(_args) => unimplemented!(),
     }
 }
@@ -142,6 +173,15 @@ fn prober_options(timeout_secs: u64) -> ProberOptions {
         timeout: std::time::Duration::from_secs(timeout_secs),
         ..ProberOptions::from_env()
     }
+}
+
+/// Options for invoking cargo, without any of the probe's timing.
+///
+/// Separate from [`prober_options`] because a build has no deadline: the
+/// `--timeout` that keeps a hung `cargo check` from wedging a `fill` run does not
+/// apply to a foreground build the user asked for and can interrupt themselves.
+fn build_options() -> ProberOptions {
+    ProberOptions::from_env()
 }
 
 /// One file's work: the path, the source *as it was before anything was
@@ -287,6 +327,90 @@ fn retry_rejected(
     }
 
     Ok((retried, rounds, verdict))
+}
+
+/// Build the generated tree, leaving the source untouched.
+///
+/// The store is not a crate -- it holds one generated `.rs` per file that had a
+/// hole, with no manifest and nothing for hole-free files -- so the build starts
+/// from a copy of the real crate with the artifacts laid over it. See
+/// [`crate::shadow`] for why the copy is worth its cost.
+///
+/// A failing build is reported through the exit status rather than an `Err`: a
+/// compile error in generated code is a normal, expected outcome that the user
+/// wants to see from rustc, not a failure of this command.
+fn build(args: BuildArgs) -> Result<()> {
+    let root = canonicalize(&args.path)
+        .with_context(|| format!("fail to canonicalize {}", args.path.display()))?;
+
+    let shadow = Shadow::new(root.clone(), args.build_dir)?;
+
+    if args.clean {
+        shadow.clean()?;
+        println!("removed {}", display_rel_path(&root, shadow.dir()));
+    }
+
+    let stats = shadow.sync()?;
+
+    println!(
+        "assembled {} at {} ({} file(s) copied, {} reused, {} artifact(s) overlaid)",
+        display_rel_path(&root, shadow.dir()),
+        shadow.dir().display(),
+        stats.copied,
+        stats.reused,
+        stats.artifacts
+    );
+
+    // rustc reports errors against paths inside the build tree. When the artifacts
+    // are links, those paths *are* the generated code, and saying so prevents a
+    // user from editing the wrong copy -- or from assuming their fix was ignored
+    // when a copy would have reverted it.
+    if stats.linked > 0 && !args.dry_run {
+        println!(
+            "note: {} artifact(s) are linked into {}, so edits to the paths rustc \
+             reports are edits to the generated code",
+            stats.linked,
+            display_rel_path(&root, &root.join(STORE_DIR).join(PATCH_DIR))
+        );
+    }
+
+    // Said out loud because its absence is invisible: `todo!()` has type `!`, so
+    // an unfilled hole compiles and the build would look like success.
+    if stats.holes_left > 0 {
+        let note = if stats.artifacts == 0 {
+            "run `cargo hole fill` first"
+        } else {
+            "those holes are still `todo!()`, so this build does not exercise them"
+        };
+        eprintln!(
+            "warning: {} hole(s) are still unelaborated in the build tree; {note}",
+            stats.holes_left
+        );
+    }
+
+    if args.dry_run {
+        println!(
+            "\nwould run `{} build {}` in {}",
+            build_options().cargo,
+            args.cargo_args.join(" "),
+            shadow.dir().display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\nbuilding {} with cargo",
+        display_rel_path(&root, shadow.dir())
+    );
+    let status = shadow.build(&build_options(), &args.cargo_args)?;
+
+    if !status.success() {
+        // Propagate the status, so a script wrapping this command sees the same
+        // answer it would from `cargo build` itself.
+        let code = status.code().unwrap_or(1);
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn list(args: ListArgs) -> Result<()> {
