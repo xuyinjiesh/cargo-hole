@@ -1,103 +1,84 @@
 # cargo-hole
 
-Find `todo!()` placeholders that carry a written specification, and fill them in
-with a model.
+> 用「规格」代替实现：找出 Rust 代码里带 `spec:` 的 `todo!()`，交给模型补全，
+> 再用 rustc 自己验收。
 
 ```rust
 pub fn resize(img: &Image) -> Image {
-    todo!("spec: scale to fit within 1024px on the longest side, keep the aspect
-           ratio, never upscale; 1920x1080 -> 1024x576")
+    todo!("spec: 缩放到最长边不超过 1024px，保持宽高比，不放大；1920x1080 -> 1024x576")
 }
 ```
 
-A hole is `todo!("spec: ...")` or `unimplemented!("spec: ...")`. The `spec:`
-prefix is the explicit opt-in: a `todo!()` without it is not a hole.
+```bash
+$ cargo hole list --path .
+$ cargo hole fill --path .          # 生成到 .cargo-hole/，源码不动
+```
 
-## The idea: rustc as a type-query API
+## 原理
 
-`todo!()`'s type is `!`, which coerces to anything, so it never produces a type
-error on its own. Replace it with `()` and rustc answers with the type that was
-expected there:
+想法来自 [硅基天启：灭世之技术推演（ChinaSys'25 Winter）](https://www.bilibili.com/video/BV1KEinBtEU6/)
+里「消灭码农」的那一问：不直接写实现，只写规格（「混合语言手册」），由模型把规格展开成项目。
+cargo-hole 是这条路线的最小可用闭环 —— **规格写在编译器看得见的地方，生成结果由编译器验收**。
+
+**1. 空洞 = 带规格的 `todo!`。**
+`todo!("spec: ...")` / `unimplemented!("spec: ...")` 就是空洞；`spec:` 前缀是显式开关，
+不带前缀的 `todo!()` 不是空洞。规格文本就是这次要实现的接口：写在函数体里、离签名和上下文最近。
+
+**2. rustc 本身就是类型查询 API。**
+`todo!()` 的类型是 `!`，可以强制转换成任何类型，所以它自己永远不会触发类型错误。
+把空洞换成 `()`，rustc 就会告诉你那个位置原本期望什么类型：
 
 ```
 E0308: expected `Image`, found `()`
 ```
 
-That yields the expected type, the exact span, and real inference results —
-including coercions — for the price of one `cargo check`.
+于是一次 `cargo check` 就换来期望类型、精确 span 和真实的推断结果（含强制转换）——这正是
+提示模型所需要的上下文。探针是批量的：一个文件里的所有空洞一次性替换，每条 `E0308` 自带 span，
+所以一次检查能回答全部空洞；批量答不了的再单独探测，因此批量结果不会弱于逐个探测。
+`--no-probe` 可关掉，此时模型只拿到规格文本和空洞的语法位置。
 
-The probe runs batched: every hole in a file is replaced with `()` at once and
-one `cargo check` answers all of them, because each `E0308` carries its own span.
-A verdict the batch cannot settle is re-probed alone, so the batched answer is
-never weaker than the serial one. `--no-probe` turns the whole thing off, and the
-model then gets only the spec text and the hole's syntactic position.
+**3. 编译门禁决定什么可以进账本。**
+生成的整棵代码树必须先通过一次 `cargo check` 才会被写出。失败时，错误会映射回它落在哪个空洞的
+生成代码里，`fill` 只对这几个空洞重问（并把 rustc 的报错原文一起给它）。
+所以账本里没有一行是没编译过的代码；被门禁拒绝的一轮什么都不会留下，`--in-place` 也不会有
+"先写入再回滚"的窗口。`--no-verify` 跳过门禁，代价是**这一轮不记录任何缓存**。
 
-## Commands
+## 安装
 
-`cargo hole` is a cargo subcommand, so it is invoked as `cargo hole <command>`.
+需要支持 edition 2024 的 Rust（1.85+）。
 
 ```bash
-cargo hole list  --path .                 # every hole, with its spec and status
-cargo hole list  --path . --width 40      # truncate specs more aggressively
-cargo hole list  --path . --pretty        # group by file, wrap specs, colour
-cargo hole list  --path . --file lib.rs   # only holes in `lib.rs`
-cargo hole list  --path . --fail-on-unelaborated   # exit 1 if any hole remains
-cargo hole fill  --path .                 # fill holes, writing to .cargo-hole/
-cargo hole fill  --path . --in-place      # ...and write back over the originals
-cargo hole build --path .                 # build the generated tree, source untouched
-cargo hole build --path . --release       # flags after the command go to cargo
-cargo hole run   --path .                 # build and run the generated tree
-cargo hole run   --path . -- a b          # arguments after `--` go to the program
+git clone <this repo> && cd cargo-hole
+cargo install --path .      # 安装 cargo-hole 到 ~/.cargo/bin，之后 `cargo hole` 可用
 ```
 
-Every command takes `--path`, the crate root to work on (default `.`). It is
-canonicalised, and unreadable paths are a fatal error.
+## 使用
 
-### `list`
+```bash
+cargo hole list  --path .                 # 列出所有空洞：位置、状态、所属函数、规格
+cargo hole list  --path . --pretty        # 按文件分组、完整换行显示，便于阅读
+cargo hole list  --path . --fail-on-unelaborated   # 还有空洞就以 1 退出，可放进 CI
 
-```
-$ cargo hole list --path .
-4 hole(s) in /tmp/demo
+cargo hole fill  --path .                 # 让模型填补，结果写到 .cargo-hole/patch/
+cargo hole fill  --path . --in-place      # 直接写回源文件（仍然先过门禁）
+cargo hole fill  --path . --no-probe      # 不探测期望类型，只给模型规格和位置
 
-[ 1] src/lib.rs:2  open  (todo, statement)
-     fn:   fn stmt()
-     spec: statement position
-
-[ 2] src/lib.rs:6  open  (todo, expression)
-     fn:   fn tail() -> u32
-     spec: tail expression
-
-[ 3] src/lib.rs:10  open  (todo, expression)
-     fn:   fn arg() -> u32
-     spec: argument position
-
-[ 4] src/lib.rs:14  open  (todo, macro-body)
-     fn:   fn macrobody() -> Vec<u32>
-     spec: inside a macro body
-
-summary: 4 open, 0 pinned, 0 unresolvable
+cargo hole build --path .                 # 在 .cargo-hole/build/ 里编译生成后的 crate
+cargo hole build --path . --release       # 命令之后的参数原样传给 cargo
+cargo hole run   --path .                 # 编译并运行
+cargo hole run   --path . -- a b          # `--` 之后的参数给程序本身
 ```
 
-Status is one of `open`, `PINNED`, or `UNRESOLVABLE`. Holes are listed one per
-blank-line-separated block: location, status, macro name, and syntactic
-position; then the enclosing signature and the spec.
+公共约定：
 
-`--pretty` switches to a layout for reading rather than grepping: holes are
-grouped under their file, the spec is wrapped instead of truncated, and a header
-tallies the run. The default layout is unchanged and is what scripts should
-parse.
+- `--path` 是要处理的 crate 根目录，默认 `.`，会被 canonicalize；每个命令都接受。
+- 只有 `spec:` 空洞会被填补；写在空洞上方连续 `//` 注释里的 `// hole:pinned`
+  会把空洞标成 `PINNED`，永不填补，也不会被缓存覆盖 —— 手写实现不想被模型动时用它。
+- 状态有三种：`open`、`PINNED`、`UNRESOLVABLE`。
+- `list` 的默认输出是给脚本解析的；`--pretty` 才是给人读的，`--color auto|always|never` 控制颜色
+  （颜色从不作为唯一信号，`NO_COLOR` 生效）。
 
-`--color <auto|always|never>` adds ANSI emphasis; the default colours a terminal
-and stays plain when piped, and `NO_COLOR` is respected. Colour is never the only
-signal — every distinction it draws is also spelled out in the text.
-
-Note that statuses are counted independently, so a hole that is both pinned and
-unresolvable is counted in both columns.
-
-`--file` matches the **file name** exactly, not a path substring — `--file
-lib.rs` works, `--file src/lib.rs` matches nothing.
-
-### `fill`
+`fill` 的运行摘要：
 
 ```
 $ cargo hole fill --path .
@@ -106,282 +87,39 @@ filling 2 hole(s) in . using cli:codex (its own model)
 2 filled, 0 cached, 0 not filled, 0 skipped (2 model call(s))
 ```
 
-The header names the agent actually in use. Without `--in-place`, results are
-written to `<root>/.cargo-hole/patch/<relative path>` and the originals are left
-untouched; with it, files are overwritten in place. Files are grouped so each is
-read and written once. All of a file's answers are spliced in a single
-left-to-right pass, which is also what records where each answer landed -- needed
-to tell which hole a compile error belongs to.
+第二次 `fill` 未改动的 crate 不需要任何模型调用（`2 cached`）：答案记在账本里，键是空洞
+**含义**的 blake3 哈希（规整空白后的规格文本、签名、`impl`/`trait` 上下文、语法位置），
+行号不在其中 —— 上面插一行、调换函数顺序、跑 `cargo fmt` 都不会失效；改规格或签名才会。
 
-A hole that cannot be filled is reported on stderr and does **not** abandon the
-rest of the file:
-
-```
-warning: skipping /tmp/demo/src/lib.rs:3: /tmp/demo/src/lib.rs:3 is pinned, so it is never regenerated
-
-1 filled, 0 cached, 1 not filled, 0 skipped (1 model call(s))
-```
-
-So `not filled` counts holes that were attempted and refused; `cached` counts
-holes answered from the ledger below; `skipped` counts pinned and unresolvable
-holes, which are never attempted.
-
-### The compile gate
-
-Before anything is recorded, the generated tree is put through a compile gate.
-The subtlety is that a plain `cargo check` of the crate root would never fail:
-a hole is `todo!()`, whose type is `!` and coerces to anything, so a crate full
-of unelaborated holes compiles cleanly — and without `--in-place` the real source
-is never modified, so checking the root checks the *unfilled* tree. The gate
-therefore patches every generated file into place, runs one `cargo check`, and
-restores every file byte-for-byte.
-
-If the tree does not compile, nothing from that run enters the ledger, and the
-errors are mapped back to the holes whose generated code they land in:
-
-```
-warning: /tmp/demo/src/lib.rs:6: E0308: mismatched types: expected `i64`, found `&str`
-re-asked for 1 answer(s) across 1 extra round(s) after the compile gate rejected them
-```
-
-`fill` re-asks for exactly those holes, quoting rustc at them, and re-gates.
-Errors that land outside every generated region are the crate's own — they are
-reported and not retried, since no answer can fix them.
-
-Nothing is written until the gate accepts. That ordering matters most for
-`--in-place`, where a write *is* the user's source: writing first and undoing on
-rejection would leave a window in which the file on disk holds code that does not
-compile. Because the write happens last, a rejected run leaves the source exactly
-as it found it, and there is nothing to roll back.
-
-`--no-verify` skips the gate. Because the ledger's one guarantee is that every
-entry is code the gate accepted, a run with `--no-verify` **records nothing**.
-
-### `build`
-
-`fill` proves the generated code *type-checks*. `build` goes further: it compiles
-the generated tree for real, so you can run it, test it, or hand its binary to
-someone.
-
-```
-$ cargo hole build --path .
-assembled .cargo-hole/build at /tmp/demo/.cargo-hole/build (4 file(s) copied, 0 reused, 2 artifacts overlaid)
-
-building .cargo-hole/build with cargo
-   Compiling demo v0.1.0 (/tmp/demo/.cargo-hole/build)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.82s
-```
-
-The reason this is a copy rather than a `cd .cargo-hole && cargo build` is that
-**`.cargo-hole/` is not a crate.** It holds one generated `.rs` per source file
-that *had a hole*, and nothing else — no `Cargo.toml`, and no file for a module
-that had no holes. Building inside it cannot work.
-
-So `build` mirrors the crate into `<root>/.cargo-hole/build/`, lays the artifacts
-over the copy, and runs cargo there. The user's source is never opened for
-writing, so there is no patch-and-restore window: a build can run for minutes,
-be interrupted, and leave a binary behind, and none of that can touch the real
-crate. That is why `build` does not reuse the gate's patch/restore machinery —
-for a check that lasts seconds it is a fair trade, and for a build it is not.
-
-Files whose contents already match are not rewritten, which keeps their mtimes
-and therefore keeps cargo's incremental cache alive. A second `build` is
-effectively free:
-
-```
-assembled .cargo-hole/build at /tmp/demo/.cargo-hole/build (0 file(s) copied, 4 reused, 2 artifacts overlaid)
-
-building .cargo-hole/build with cargo
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
-```
-
-#### The overlay is a symlink
-
-Artifacts are not copied into the build tree — they are **linked** to
-`.cargo-hole/patch/`. That matters because rustc reports errors against paths
-inside the tree it compiled:
-
-```
-error[E0599]: no method named `parse` found for type `Value`
- --> /tmp/demo/.cargo-hole/build/src/util.rs:8:9
-```
-
-With a copy, that path names a duplicate. A user opens exactly the file rustc
-told them about, fixes it, rebuilds — and the next `sync` silently overwrites the
-edit with the patch tree's version. The fix vanishes, and nothing explains why.
-
-With a link, both names are the same file. Editing the reported path edits the
-generated code, and cargo's mtime check sees it, so the fix survives the rebuild.
-`build` says when this applies:
-
-```
-note: 2 artifact(s) are linked into .cargo-hole/patch, so edits to the paths rustc
-reports are edits to the generated code
-```
-
-Where symlinks are unavailable — a filesystem without them, or Windows without
-the privilege — `build` falls back to copying and works identically, except that
-edits then belong in `.cargo-hole/patch/`. The fallback is silent, because
-warning on every run about a property of the user's filesystem would be noise.
-
-`--clean` remains safe: `remove_dir_all` deletes the links, never their targets,
-so the generated code is untouched.
-
-Anything after the command goes to cargo unchanged, so `cargo hole build
---release`, `--features foo` and `-p member` all work without `cargo hole`
-knowing about them. `--dry-run` assembles the tree and prints what it *would*
-run; `--clean` deletes the tree first; `--build-dir` moves it.
-
-A build that fails exits with cargo's status, so wrapping this in a script gives
-the same answer `cargo build` would.
-
-One caveat worth knowing: an unelaborated hole is still `todo!()`, whose type is
-`!`, so a crate full of open holes **compiles**. `build` says so explicitly
-rather than reporting a clean success:
-
-```
-warning: 2 hole(s) are still unelaborated in the build tree; run `cargo hole fill` first
-```
-
-For the same reason, if `build` ever found generated code it could not read — an
-older `.cargo-hole/src/` layout, say — it refuses rather than building the crate
-as-is, which would compile perfectly and quietly run with every hole
-unimplemented.
-
-Add `.cargo-hole/build/` to your `.gitignore`: it is a full second copy of the
-crate plus its own `target/`.
-
-### `run`
-
-`run` assembles the same tree and then runs it, like `cargo run`:
-
-```
-$ cargo hole run --path .
-assembled .cargo-hole/build at /tmp/demo/.cargo-hole/build (...)
-
-running .cargo-hole/build with cargo
-      Running `.cargo-hole/build/target/debug/demo`
-```
-
-It is not `build && ./target/debug/demo`, for two reasons.
-
-**The working directory.** `cargo run` gives the program the directory cargo was
-invoked in. Running it *inside* the build tree would therefore hand the program
-the tree instead of your crate, so a relative path it opens — `./data/input.txt`,
-a config next to the manifest, anything resolved at runtime — would silently point
-at a copy. The copy usually contains those files, which is what makes this quiet
-rather than loud: it works until the program writes, or until the two diverge.
-
-So `run` keeps the crate's directory as the working directory and points cargo at
-the tree's manifest instead. Output still lands in the tree's `target/`, so your
-real `target/` stays untouched, exactly as with `build`.
-
-**Target selection.** `cargo run` knows which target `--bin`, `-p` or `--example`
-selected and where the result landed. Locating the binary by hand would be a
-second implementation of cargo's own rules, and one that quietly disagrees the
-moment a profile or target layout changes.
-
-The program's exit status reaches the caller unchanged, so a script sees what
-`cargo run` would have told it:
-
-```
-$ cargo hole run --path . ; echo $?
-3
-```
-
-`--` separates the two kinds of argument, matching `cargo run`:
-
-```
-cargo hole run --path . --release --bin app   # these go to cargo
-cargo hole run --path . -- --nocapture        # these go to the program
-```
-
-`--help` after the separator belongs to the program, not to `cargo hole` — which
-is what you want when the program has its own flags. The other spelling works too:
-anything after an explicit `--` is re-emitted to cargo behind a `--` of its own,
-since `cargo run alpha` would otherwise read `alpha` as a cargo argument and fail.
-
-`--clean`, `--build-dir` and `--dry-run` behave as they do for `build`.
-
-### The ledger
-
-Everything `cargo hole` writes lives under one directory, and each thing in it
-has one job:
+## 生成物
 
 ```
 .cargo-hole/
-├── patch/          generated code, mirroring the source tree
-│   └── src/lib.rs
-├── ledger.jsonl    every answer the compile gate accepted
-├── .cargo-hole.probe.lock
-└── build/          the shadow tree (disposable; safe to delete)
+├── patch/         生成后的代码，镜像源码树
+├── ledger.jsonl   每个通过编译门禁的答案（追加写，按空洞含义的哈希索引）
+└── build/         影子构建树，派生自 patch/，随时可删
 ```
 
-`patch/` holds the product; `build/` is derived from it and can be deleted at any
-time — the next `build` recreates it. Keeping them apart means no command has to
-guess which one it is looking at.
+`patch/` 是产物，`build/` 是派生物，两者分开，命令不必猜自己在看哪一个。
+`build` 不是 `cd .cargo-hole && cargo build`：那里没有 `Cargo.toml`，也没有无空洞文件的副本，
+所以它是把整个 crate 镜像到 `.cargo-hole/build/`、再把生成结果覆盖（软链接）上去，在副本里跑 cargo ——
+源文件全程不被写入。请把 `.cargo-hole/build/` 加进 `.gitignore`。
 
-A second `fill` of an unchanged crate costs nothing:
+注意：未填补的空洞仍是 `todo!()`，类型是 `!`，所以**满是空洞的 crate 也能编译**。
+`build` 会显式警告还有多少空洞没填，而不是报一个干净的 success。
 
-```
-$ cargo hole fill --path .
-0 filled, 2 cached, 0 not filled, 0 skipped (0 model call(s))
-```
+## 配置
 
-Each answer is recorded in `<root>/.cargo-hole/ledger.jsonl`, one JSON object
-per line, keyed by a blake3 hash of the hole's *meaning* -- the spec text with
-whitespace collapsed, the enclosing signature, the `impl`/`trait` context and
-the syntactic position. Line numbers are deliberately not part of the key, so
-inserting a line above a hole, reordering functions, or running `cargo fmt` all
-keep their answers; changing the spec or the signature does not.
-
-The file is append-only: an update is a new line, so there is no
-read-modify-write window in which two runs can lose each other's entries, and a
-crash can only truncate the tail. The newest line for an id wins. Entries
-written by a different schema version are ignored rather than misread --
-regenerating one answer costs a model call, whereas misreading one could splice
-the wrong code into a file.
-
-Two properties are worth knowing:
-
-- **Nothing is recorded until the generated tree has compiled.** Answers are
-  held in memory, the whole tree is put through the compile gate
-  (`src/verifier.rs`), and only then are the artifacts written and the accepted
-  answers recorded. So an interrupted run never leaves behind a ledger entry for
-  code that was never written, and *nothing* in the ledger is code that was never
-  compiled. A run that fails the gate records nothing, which is why the next run
-  has to generate those answers again -- see `--no-verify` below.
-- **The gate is per tree, not per hole.** One hole's answer can depend on what
-  another hole was filled with, so "this hole compiled" is not a property a
-  single hole can have. One `cargo check` covers the whole generated tree, and a
-  failure means no answer from that run is recorded.
-- **A rejection names the answers at fault.** Errors are mapped back to the hole
-  whose generated code they land in, so `fill` can re-ask for exactly those
-  holes -- quoting rustc at them -- instead of discarding the whole run's work.
-  Errors that land outside every generated region belong to the crate as it
-  already was; they are reported rather than retried, because no answer can fix
-  them.
-- **A pin is never routed around.** A hole that has been pinned is regenerated
-  (i.e. refused), never replayed from the ledger, even if an earlier run cached
-  an answer for it before it was pinned. Otherwise the cache would quietly
-  overwrite hand-written code.
-
-## Configuration
-
-Settings are layered, most specific last:
-
-1. the built-in defaults,
-2. `.cargo-hole.toml` in the crate root,
-3. the `CARGO_HOLE_*` environment variables,
-4. the command line flags.
+设置分层叠加，越靠后优先级越高：内置默认值 → crate 根目录的 `.cargo-hole.toml` → `CARGO_HOLE_*`
+环境变量 → 命令行参数。
 
 ```toml
-# .cargo-hole.toml
+# .cargo-hole.toml（放在 --path 指向的目录，而不是当前工作目录）
 [model]
-model       = "qwen3.7-max"   # empty/absent defers to the CLI's own config
+model       = ""                    # 留空表示用 CLI 自己的配置
 base_url    = "http://127.0.0.1:11434/v1"
-api_key_env = "MY_API_KEY"    # preferred: keeps the file safe to commit
-api_key     = "sk-literal"    # honoured, but api_key_env wins if both are set
+api_key_env = "MY_API_KEY"          # 推荐：文件可以安全提交
+api_key     = "sk-literal"          # 也支持，两者同时存在时 api_key_env 优先
 
 [fill]
 max_attempts = 3
@@ -389,133 +127,49 @@ max_tokens   = 2048
 temperature  = 0.0
 ```
 
-| environment variable | effect |
+| 环境变量 | 作用 |
 |---|---|
-| `CARGO_HOLE_CLI` | agent CLI to drive (only `codex` is known) |
-| `CARGO_HOLE_MODEL` | model name |
+| `CARGO_HOLE_CLI` | 驱动的 agent CLI（目前只认 `codex`） |
+| `CARGO_HOLE_MODEL` | 模型名 |
 | `CARGO_HOLE_BASE_URL` | base URL |
 | `CARGO_HOLE_API_KEY` | API key |
-| `CARGO_HOLE_MAX_ATTEMPTS` | attempts per hole |
-| `CARGO_HOLE_MAX_TOKENS` | upper bound on generated tokens |
-| `CARGO_HOLE_TEMPERATURE` | sampling temperature |
+| `CARGO_HOLE_MAX_ATTEMPTS` | 每个空洞的尝试次数 |
+| `CARGO_HOLE_MAX_TOKENS` | 生成 token 上限 |
+| `CARGO_HOLE_TEMPERATURE` | 采样温度 |
 
-An empty variable or an empty flag is ignored rather than applied, so
-`CARGO_HOLE_MODEL=` cannot silently erase a model named in the config file. A
-value that fails to parse is warned about and dropped.
+空变量/空参数会被忽略而不是覆盖已有的值；解析失败的值会告警并丢弃；config 文件里出现未知键时
+整个文件被丢弃（并提示可接受的键名），不会半途生效。
 
-The config file is read from the crate root given to `--path`, **not** from the
-working directory, so one shell can point `--path` at several crates and pick up
-each crate's own config. Keys are validated: an unknown key makes the whole file
-be dropped rather than half-applied, and the warning names the accepted keys.
+## 当前状态
 
-```toml
-[model]
-provider = "cli"                       # -> unknown field `provider`
-```
+已实现：空洞发现与列出、规格解析、`// hole:pinned`、语法位置判定、`codex` agent、失败重试、
+配置分层、写出到 `.cargo-hole/` 或 `--in-place`、缓存账本、批量类型探针、编译门禁、
+`build` 的影子构建树、`run`。
 
-```
-warning: ignoring /tmp/demo/.cargo-hole.toml: TOML parse error at line 2, column 1
-  |
-2 | provider = "cli"
-  | ^^^^^^^^
-unknown field `provider`, expected one of `model`, `base_url`, `api_key`, `api_key_env`
-```
+尚未实现（因此没有任何东西依赖它们）：
 
-## Marking and excluding holes
+- `cargo hole restore` —— 子命令存在但直接 `unimplemented!()` panic；探针锁、`.cargo-hole.bak`
+  和 `restore_leftovers` 都已写好并测试过，只是 CLI 没有调用。
+- `--at <file>:<line>` —— 被 CLI 接受但被忽略，仍然填补所有空洞。
+- Provider 可插拔 —— 只有设计草案 `docs/providers.md`，没有 `Provider` trait / `script` provider；
+  唯一可用的 agent 是 `codex` CLI。相应地 `base_url`、`api_key`、`max_tokens`、`temperature`
+  会被解析和分层，但目前无人读取。
+- `#[hole::pin]` / `#[pin]` 写在**外层**函数、方法、`impl` 或 `trait` 上时不生效（栈被遮蔽的
+  bug，`has_pin_attribute` 与文档承诺的行为不符）。在修好之前，把属性直接写在 `todo!` 上，
+  或者用 `// hole:pinned`。
+- `cargo hole type` —— 只报告空洞期望类型而不填补的命令；探针已经能回答，只是没暴露。
 
-- `todo!("spec: ...")` / `unimplemented!("spec: ...")` — a hole. Only the
-  parenthesised form counts; `todo! { "spec: ..." }` is ignored. The argument
-  list must be a single string literal and an optional trailing comma; anything
-  more elaborate is not treated as a spec.
-- `// hole:pinned` anywhere in the run of whitespace and `//` comments directly
-  above the hole — the hole is reported as `PINNED` and never filled. Only `//`
-  lines count: `/* hole:pinned */` is ignored, as is a marker on the same line
-  as the hole or after it.
-- `#[hole::pin]` / `#[pin]` — works when written directly on the hole itself
-  (`#[pin]` above a statement-position `todo!`), but **not on the enclosing
-  function, method, `impl` or `trait`**, which the docs and `has_pin_attribute`
-  both promise. The cause is a shadowed stack: the item visitors push onto
-  `pin_stack`, but `visit_macro` records the hole from `pin_stack.last()`
-  *before* `visit_stmt_macro`/`visit_expr_macro` push the macro's own (usually
-  `false`) entry, so the enclosing item's value is never the one read. Until
-  that is fixed, put the attribute on the `todo!` itself or use
-  `// hole:pinned`.
-
-`spec:` holes inside another macro's token body are found too, because macro
-bodies are walked as raw tokens — `vec![todo!("spec: ...")]` is a hole.
-
-## Position detection
-
-Each hole records where it sits in the syntax tree, which is the hint a type
-probe would use.
-
-| shape | position |
-|---|---|
-| `todo!("spec: ...");` as a whole statement | `statement` |
-| tail expression, argument, `if` condition, … | `expression` |
-| inside another macro's tokens: `vec![todo!("spec: ...")]` | `macro-body` |
-| item position | `item` |
-| could not be determined | `unknown` |
-
-A statement-position hole is known to be `()` even when rustc's inference cannot
-say so — which is exactly the case the probe exists to cover.
-
-## Current status
-
-Implemented: hole discovery and listing, spec parsing, the `// hole:pinned`
-marker, position detection, the `codex` agent, retry-on-failure, config and
-environment layering, writing results in place or to `.cargo-hole/`, the ledger
-that lets a repeated `fill` skip the model entirely, the batched type probe, the
-compile gate that decides what may enter the ledger, `build`, which compiles the
-generated tree in a shadow copy of the crate, and `run`, which runs it.
-
-Not implemented yet, and therefore not relied upon by anything:
-
-- **`cargo hole restore`.** The subcommand exists and panics with
-  `not implemented` (exit 101). The probe lock, the `.cargo-hole.bak` files and
-  `restore_leftovers` all exist and are tested, but nothing calls the function
-  from the CLI.
-- **`--at <file>:<line>`.** Accepted by the CLI and ignored; `--at` fills every
-  hole anyway. (`--timeout` does now reach both the probe and the gate.)
-- **Provider pluggability.** `docs/providers.md`, a `Provider` trait, a `script`
-  provider and the `[model] provider/command/args` keys do not exist — the only
-  agent is the `codex` CLI.
-- **`Hole::hole_id`**, a blake3 hash over spec, signature, impl context,
-  position and edition, is implemented but never called by anything.
-- **`cargo hole type`**, a command that would report a hole's expected type
-  without filling it. The probe can answer this; nothing exposes it yet.
-
-## Development
+## 开发与文档
 
 ```bash
-cargo test            # 67 tests, all offline
+cargo test      # 248 个测试，全部离线，不需要网络
 cargo build
 ```
 
-The suite is hermetic: the 67 tests live in `src/agent.rs` (10), `src/filler.rs`
-(4), `src/storage.rs` (14), `src/storage/disk.rs` (11) and `src/render.rs` (28),
-need no network, and there is no ignored/live-provider test group.
+- [`docs/design.md`](docs/design.md) —— 详细设计说明（原 README，英文）：每条命令背后的取舍、
+  门禁与账本的契约、类型探针拦不到的边界情况、模块职责表、已知问题。
+- [`docs/providers.md`](docs/providers.md) —— Provider 插件的设计草案（尚未实现）。
 
-> Known flake: `temp_root()` builds a per-test directory out of the process id
-> and a counter but never removes it, so a recycled pid can inherit a directory
-> whose ledger already has lines and the `assert_eq!(lines.len(), 2)` checks
-> fail. `rm -rf /tmp/cargo-hole-*` clears it. This predates the ledger work and
-> is untouched by it.
-
-### Layout
-
-| module | responsibility |
-|---|---|
-| `hole.rs` | `syn`-based extraction of holes, spec parsing, pin markers, positions |
-| `cmdline.rs` | the `clap` CLI: `list`, `fill`, `restore` |
-| `filler.rs` | prompt assembly, reply extraction, splicing into the file |
-| `storage.rs` | the store, the ledger entry format, and `Hole::hole_key` contracts |
-| `storage/disk.rs` | the on-disk backend: atomic artifacts and an append-only ledger |
-| `render.rs` | `list` output: the plain and pretty layouts, colour, wrapping, width |
-| `agent.rs` | config file and `CARGO_HOLE_*` layering, agent selection |
-| `agent/codex.rs` | driving `codex exec --json`, parsing its JSONL events |
-| `util.rs` | file walk, byte-level scanner (delimiters, comments, strings), line/column |
-| `prober.rs` | the type probe: patch a hole with `()`, read the `E0308`, restore |
-| `verifier.rs` | the compile gate: check the whole generated tree, blame the answers at fault |
-| `shadow.rs` | the shadow tree behind `build`/`run`: mirror the crate, link the artifacts over it, run cargo there |
-| `main.rs`, `lib.rs` | thin entry point and module list |
+模块划分：`hole.rs`（syn 提取空洞）、`cmdline.rs`（CLI）、`filler.rs`（提示词与拼接）、
+`storage*.rs`（账本）、`render.rs`（list 输出）、`agent*.rs`（配置分层与 codex）、
+`prober.rs`（类型探针）、`verifier.rs`（编译门禁）、`shadow.rs`（影子构建树）、`util.rs`。
